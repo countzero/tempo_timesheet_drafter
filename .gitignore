@@ -1,0 +1,23 @@
+#
+# .gitignore
+#
+
+#
+# GENERAL
+#
+
+# OpenCode tooling defect creates a 'nul' file on Windows.
+# TODO: Remove when https://github.com/anomalyco/opencode/issues/11403 is fixed.
+nul
+
+# Ignore environment variable file containing secrets.
+.env
+
+# Real working hours of the planning test stay local. See AGENTS.md "Non-obvious behavior".
+tempo_timesheet_drafter.fixture.json
+
+# Ignore Sublime Text files.
+*.sublime-workspace
+
+# Local scratch directory for all agent-generated artifacts. See AGENTS.md "Scratch Files".
+.tmp/
