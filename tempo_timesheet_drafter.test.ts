@@ -12,14 +12,19 @@ import { test } from 'node:test';
 import {
     closest,
     collapseBatches,
+    commitActivities,
+    dayNotes,
     duration,
     filledCells,
+    fit,
+    fitBoth,
     hyperlinks,
     isDate,
     isoWeek,
     issueKey,
     issueUrl,
     keyPieces,
+    lanes,
     parseCalendar,
     parseDuration,
     parseLines,
@@ -30,8 +35,10 @@ import {
     statusLine,
     summaryLine,
     withoutKey,
+    wrapFit,
+    wrapWords,
 } from './tempo_timesheet_drafter.ts';
-import type { Activity, Booked, CalendarEvent, Day, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View } from './tempo_timesheet_drafter.ts';
+import type { Activity, Booked, CalendarEvent, Commit, Day, Entry, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View } from './tempo_timesheet_drafter.ts';
 
 // Local time decides the day and the quarter-hours; a fixed zone gives the same results on every machine and in CI.
 process.env.TZ = 'Europe/Berlin';
@@ -602,6 +609,80 @@ test('summaryLine after a failure keeps what the other sources brought and marks
 
     // Assert
     assert.equal(line, '✗ Fetch failed: Tempo 23 worklogs · Jira ✗ · Calendar … · GitHub … · 12s');
+});
+
+test('commitActivities counts a pull request merge as a review and skips other merges without an issue key', () => {
+
+    // Arrange
+    const node = (headline: string, parents = 1): Commit => ({ oid: headline, authoredDate: `${DAY.date}T09:05:00+01:00`, messageHeadline: headline, parents: { totalCount: parents } });
+    const commits = [
+        node('[SHOP-1] Validate the address'),
+        node('Merge pull request #7 from shop/issue/SHOP-2', 2),
+        node('Merge develop into issue/SHOP-3', 2),
+        node('Merge branch develop', 2),
+        node('Bump dependencies'),
+    ];
+
+    // Act
+    const activities = commitActivities(commits, PROJECTS);
+
+    // Assert
+    assert.deepEqual(activities.map((activity) => [activity.kind, activity.issue, activity.time]), [
+        ['commit', 'SHOP-1', 545],
+        ['review', 'SHOP-2', 545],
+        ['merge', 'SHOP-3', 545],
+        ['commit', undefined, 545],
+    ]);
+});
+
+test('lanes puts overlapping entries side by side and widens an entry into a lane that is free beside it', () => {
+
+    // Arrange
+    const entry = (start: number, minutes: number, issue: string) => ({ entry: { date: DAY.date, start, minutes, issue, description: '' }, booked: false });
+    const entries = [entry(540, 60, 'A'), entry(540, 15, 'B'), entry(540, 15, 'C'), entry(555, 45, 'D'), entry(660, 15, 'E')];
+
+    // Act
+    const { placed, hidden } = lanes(entries, 3);
+    const narrow = lanes(entries, 2);
+
+    // Assert
+    assert.deepEqual(placed.map((item) => `${item.issue} ${item.lane}+${item.span}/${item.lanes}`), ['A 0+1/3', 'B 1+1/3', 'C 2+1/3', 'D 1+2/3', 'E 0+1/1']);
+    assert.deepEqual(hidden, []);
+    assert.deepEqual(narrow.hidden.map((item) => item.issue), ['C']);
+});
+
+test('dayNotes puts questions first, then missing hours, then the sources of the lines', () => {
+
+    // Arrange
+    const entries: Array<Entry> = [
+        { date: DAY.date, start: 540, minutes: 30, issue: 'TEAM-1', description: 'Daily', meeting: true },
+        { date: DAY.date, start: 600, minutes: 60, issue: '?', description: 'Kundentermin', meeting: true, question: 'Which issue?' },
+        { date: DAY.date, start: 660, minutes: 60, issue: 'SHOP-1', description: 'Implementation', evidence: 'Validate the address' },
+    ];
+
+    // Act
+    const notes = dayNotes(entries, ['· batch: 17:10 SHOP-2', '! 30m short of 7h', '? also active on SHOP-3']);
+
+    // Assert
+    assert.deepEqual(notes, [
+        '? 10:00 Kundentermin: Which issue?',
+        '? also active on SHOP-3',
+        '! 30m short of 7h',
+        '· batch: 17:10 SHOP-2',
+        '· calendar: 09:00 TEAM-1, 10:00 ?',
+        '· SHOP-1: Validate the address',
+    ]);
+});
+
+test('fit, fitBoth, wrapFit and wrapWords measure in cells, wide characters count two', () => {
+
+    // Act and Assert
+    assert.equal(fit('abcdef', 4), 'abc…');
+    assert.equal(fit('日本語', 4), '日…');
+    assert.equal(fitBoth('Mon 02', '8h/7h', 12), 'Mon 02 8h/7h');
+    assert.equal(fitBoth('Monday long', '8h', 8), 'Mond… 8h');
+    assert.deepEqual(wrapFit('one two three four', 9, 2), ['one two', 'three fo…']);
+    assert.deepEqual(wrapWords('aaaaaaaaaa bb', 4), ['aaaa', 'aaaa', 'aa', 'bb']);
 });
 
 interface Span {

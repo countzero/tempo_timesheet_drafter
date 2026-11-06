@@ -478,7 +478,7 @@ async function viewer(): Promise<Viewer> {
   return (await github<{ viewer: Viewer }>("query { viewer { id login } }", {})).viewer;
 }
 
-interface Commit {
+export interface Commit {
   oid: string;
   authoredDate: string;
   messageHeadline: string;
@@ -620,7 +620,7 @@ async function commits(
 }
 
 /** Commits as activity, once the Jira project keys are known to find the issue in each subject. */
-function commitActivities(commits: Commit[], projects: Set<string>): Activity[] {
+export function commitActivities(commits: Commit[], projects: Set<string>): Activity[] {
   const result: Activity[] = [];
   for (const node of commits) {
     const authored = new Date(node.authoredDate);
@@ -1330,7 +1330,7 @@ export function planDay(
 const NOTE_ORDER = ["?", "!", "·"];
 
 /** Questions, then missing hours, then where the lines come from; each names its line by time or key. */
-function dayNotes(entries: Entry[], notes: string[]): string[] {
+export function dayNotes(entries: Entry[], notes: string[]): string[] {
   const result = entries.filter((entry) => entry.question).map((entry) => `? ${clock(entry.start)} ${entry.issue === "?" ? entry.description : entry.issue}: ${entry.question}`);
   result.push(...notes);
   const meetings = entries.filter((entry) => entry.meeting).map((entry) => `${clock(entry.start)} ${entry.issue}`);
@@ -1533,7 +1533,7 @@ function painter(tty: { depth: number; links: boolean } | undefined) {
 }
 
 /** Word wrap by display width; a word longer than a line is split between graphemes. Nothing is cut. */
-function wrapWords(text: string, width: number): string[] {
+export function wrapWords(text: string, width: number): string[] {
   if (!Number.isFinite(width)) return [text];
   const lines: string[] = [];
   let line = "";
@@ -1753,7 +1753,7 @@ function textWidth(text: string): number {
   return graphemes(text).reduce((sum, grapheme) => sum + cellWidth(grapheme), 0);
 }
 
-function fit(text: string, width: number): string {
+export function fit(text: string, width: number): string {
   if (width <= 0) return "";
   if (textWidth(text) <= width) return text;
   let result = "";
@@ -1767,7 +1767,7 @@ function fit(text: string, width: number): string {
 }
 
 /** `left` and `right` in exactly `width` cells; `left` gets cut first. */
-function fitBoth(left: string, right: string, width: number): string {
+export function fitBoth(left: string, right: string, width: number): string {
   const rightWidth = textWidth(right);
   if (!right || rightWidth + 2 > width) return fit(left || right, width);
   const head = fit(left, width - rightWidth - 1);
@@ -1775,7 +1775,7 @@ function fitBoth(left: string, right: string, width: number): string {
 }
 
 /** Word wrap into at most `lines` lines; a word too long for a line is cut, overflow ends the last line with "…". */
-function wrapFit(text: string, width: number, lines: number): string[] {
+export function wrapFit(text: string, width: number, lines: number): string[] {
   if (width <= 0 || lines <= 0) return [];
   const all: string[] = [];
   let line = "";
@@ -1831,7 +1831,7 @@ function renderCells(rows: Cell[][], tty: { depth: number; links: boolean } | un
  * Side-by-side lanes for overlapping entries, as FullCalendar and react-big-calendar do: clusters of colliding entries,
  * each in the leftmost free lane, then widened into free lanes to the right. Lanes past `maxLanes` are hidden.
  */
-function lanes(entries: { entry: Entry; booked: boolean }[], maxLanes: number): { placed: Item[]; hidden: Item[] } {
+export function lanes(entries: { entry: Entry; booked: boolean }[], maxLanes: number): { placed: Item[]; hidden: Item[] } {
   const items: Item[] = entries.map(({ entry, booked }) => {
     const row = Math.floor(entry.start / STEP);
     return { ...entry, booked, row, end: Math.max(row + 1, Math.ceil((entry.start + entry.minutes) / STEP)), lane: 0, lanes: 1, span: 1 };
