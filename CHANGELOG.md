@@ -3,6 +3,11 @@
 This changelog follows [Common Changelog](https://common-changelog.org) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-11-06
+
+### Fixed
+- Put the `!` and `✗` marks of `book`'s notes in the same column as in the draft list.
+
 ## [1.1.0] - 2026-11-06
 
 ### Changed
@@ -36,5 +41,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Add the agent skill `SKILL.md`, which drafts, describes the work, asks about open points and books only after your approval.
 - Add a `node:test` suite that scores the planning against real booked days.
 - Add the README, `AGENTS.md` and the MIT license.
+
+[1.1.1]: https://github.com/countzero/tempo_timesheet_drafter/releases/tag/v1.1.1
 
 [1.1.0]: https://github.com/countzero/tempo_timesheet_drafter/releases/tag/v1.1.0

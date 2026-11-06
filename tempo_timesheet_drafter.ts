@@ -2684,11 +2684,7 @@ async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> 
   const say = (line = "") => console.log(line);
   const gap = () => say(paint("#", COLOR.faint));
   const comment = (text: string, mark = "", color?: Rgb) => {
-    const lead = mark ? `#   ${mark} ` : "# ";
-    wrapWords(text, Math.max(8, width - lead.length)).forEach((part, index) => {
-      const head = index ? paint("#".padEnd(lead.length), COLOR.faint) : `${paint(mark ? "#   " : "# ", COLOR.faint)}${mark ? `${paint(mark, color, { bold: true })} ` : ""}`;
-      say(head + paint(part, COLOR.dim));
-    });
+    for (const line of commentLines(paint, text, width, mark, color)) say(line);
   };
 
   const dates = [...new Set(planned.map((entry) => entry.date))].sort();
