@@ -10,6 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import {
+    classify,
     closest,
     collapseBatches,
     commitActivities,
@@ -40,7 +41,7 @@ import {
     wrapFit,
     wrapWords,
 } from './tempo_timesheet_drafter.ts';
-import type { Activity, CalendarEvent, Cell, Commit, Day, DayPlan, Entry, Mark, Note, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View } from './tempo_timesheet_drafter.ts';
+import type { Activity, Booked, CalendarEvent, Cell, Commit, Day, DayPlan, DraftLine, Entry, Mark, Note, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View } from './tempo_timesheet_drafter.ts';
 
 // Local time decides the day and the quarter-hours; a fixed zone gives the same results on every machine and in CI.
 process.env.TZ = 'Europe/Berlin';
@@ -213,6 +214,29 @@ test('parseLines names each stopped line with its number', () => {
         'line 4: 2026-11-06 is in the future.',
         'line 5: 11:45 plus 30m ends after now (12:00).',
     ]);
+});
+
+test('classify skips a line booked already or repeated and warns about overlaps', () => {
+
+    // Arrange
+    const line = (number: number, time: string, minutes: number, issue: string): DraftLine => ({
+        line: number, date: DAY.date, start: Number(time.slice(0, 2)) * 60 + Number(time.slice(3)), minutes, issue, description: 'Work',
+    });
+    const ids = new Map([['SHOP-1', 1], ['SHOP-2', 2]]);
+    const existing: Array<Booked> = [{ date: DAY.date, start: 540, minutes: 30, issue: 'SHOP-1', issueId: 1, description: 'Work' }];
+    const entries = [line(1, '09:00', 30, 'SHOP-1'), line(2, '10:00', 30, 'SHOP-2'), line(3, '10:00', 30, 'SHOP-2'), line(4, '09:15', 30, 'SHOP-2')];
+
+    // Act
+    const { planned, warnings } = classify(entries, (key) => ids.get(key)!, existing);
+
+    // Assert
+    assert.deepEqual(planned.map((entry) => [entry.line, entry.issueId, entry.duplicate, entry.repeats]), [
+        [1, 1, true, undefined],
+        [2, 2, false, undefined],
+        [3, 2, true, 2],
+        [4, 2, false, undefined],
+    ]);
+    assert.deepEqual(warnings, ['line 4 overlaps booked 09:00–09:30 SHOP-1.']);
 });
 
 test('closest suggests a command for a typo or a prefix, nothing for noise', () => {

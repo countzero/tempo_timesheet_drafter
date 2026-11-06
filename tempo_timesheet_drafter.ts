@@ -2468,11 +2468,11 @@ function demo(view: ViewName | undefined, now: Date): void {
 
 // --- book -----------------------------------------------------------------
 
-interface DraftLine extends Entry {
+export interface DraftLine extends Entry {
   line: number;
 }
 
-interface Planned extends DraftLine {
+export interface Planned extends DraftLine {
   issueId: number;
   duplicate: boolean;
   repeats?: number;
@@ -2549,11 +2549,19 @@ async function check(
   if (problems.length) throw abort();
 
   const dates = entries.map((entry) => entry.date).sort();
-  const existing = entries.length ? await booked(account, dates[0], dates[dates.length - 1]) : [];
+  const existing = await booked(account, dates[0], dates[dates.length - 1]);
+  return { account, existing, remaining, ...classify(entries, (key) => ids.get(key)!, existing) };
+}
+
+/**
+ * Each line against the worklogs and the lines before it: one identical to either is skipped, so running book twice is
+ * safe; an overlap only warns, since the draft itself places overlapping meetings.
+ */
+export function classify(entries: DraftLine[], idOf: (key: string) => number, existing: Booked[]): { planned: Planned[]; warnings: string[] } {
   const warnings: string[] = [];
   const planned: Planned[] = [];
   for (const entry of entries) {
-    const id = ids.get(entry.issue)!;
+    const id = idOf(entry.issue);
     const same = (other: { issueId: number; date: string; start: number; minutes: number }) =>
       other.issueId === id && other.date === entry.date && other.start === entry.start && other.minutes === entry.minutes;
     const overlaps = (other: Entry) => other.date === entry.date && other.start < entry.start + entry.minutes && entry.start < other.start + other.minutes;
@@ -2565,7 +2573,35 @@ async function check(
     }
     planned.push({ ...entry, issueId: id, duplicate, repeats });
   }
-  return { account, planned, existing, warnings, remaining };
+  return { planned, warnings };
+}
+
+/** The required minutes per date; without them only the headers lose their hours, booking does not depend on them. */
+async function requiredMinutes(dates: string[]): Promise<Map<string, number>> {
+  const required = new Map<string, number>();
+  try {
+    for (const day of await schedule(dates[0], dates[dates.length - 1])) required.set(day.date, Math.round(day.requiredSeconds / 60));
+  } catch {
+    // The headers show the booked hours alone.
+  }
+  return required;
+}
+
+/** Posts one worklog with the issue's remaining estimate minus the time spent, not below 0, like Jira's auto-adjust. */
+async function postWorklog(entry: Planned, account: string, remaining: Map<number, number>): Promise<number> {
+  const remainingEstimateSeconds = Math.max(0, (remaining.get(entry.issueId) ?? 0) - entry.minutes * 60);
+  const worklog = await tempo<{ tempoWorklogId: number }>("/4/worklogs", "POST", {
+    authorAccountId: account,
+    issueId: entry.issueId,
+    startDate: entry.date,
+    startTime: `${clock(entry.start)}:00`,
+    timeSpentSeconds: entry.minutes * 60,
+    remainingEstimateSeconds,
+    description: entry.description,
+  });
+  // The next line on the same issue starts from what this one left.
+  remaining.set(entry.issueId, remainingEstimateSeconds);
+  return worklog.tempoWorklogId;
 }
 
 /**
@@ -2592,12 +2628,7 @@ async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> 
   };
 
   const dates = [...new Set(planned.map((entry) => entry.date))].sort();
-  const required = new Map<string, number>();
-  try {
-    for (const day of await schedule(dates[0], dates[dates.length - 1])) required.set(day.date, Math.round(day.requiredSeconds / 60));
-  } catch {
-    // Only the headers lose their required hours; booking does not depend on them.
-  }
+  const required = await requiredMinutes(dates);
   const range = dates.length > 1 ? `${dates[0]}..${dates[dates.length - 1]}` : dates[0];
   const widths = lineWidths(planned);
   const statusWidth = dryRun ? "would book".length : "booked 00000000".length;
@@ -2636,18 +2667,7 @@ async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> 
         continue;
       }
       try {
-        const remainingEstimateSeconds = Math.max(0, (remaining.get(entry.issueId) ?? 0) - entry.minutes * 60);
-        const worklog = await tempo<{ tempoWorklogId: number }>("/4/worklogs", "POST", {
-          authorAccountId: account,
-          issueId: entry.issueId,
-          startDate: entry.date,
-          startTime: `${clock(entry.start)}:00`,
-          timeSpentSeconds: entry.minutes * 60,
-          remainingEstimateSeconds,
-          description: entry.description,
-        });
-        remaining.set(entry.issueId, remainingEstimateSeconds);
-        line(entry, `booked ${worklog.tempoWorklogId}`, COLOR.done);
+        line(entry, `booked ${await postWorklog(entry, account, remaining)}`, COLOR.done);
         added++;
       } catch (error) {
         failed++;
