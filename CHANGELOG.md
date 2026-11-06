@@ -7,6 +7,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - Put the `!` and `✗` marks of `book`'s notes in the same column as in the draft list.
+- Retry the calendar download after a rate limit or server error, like every other request, and send the user agent with it.
 
 ## [1.1.0] - 2026-11-06
 

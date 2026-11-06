@@ -336,29 +336,24 @@ export function withoutKey(text: string, key: string): string {
 
 // --- APIs -----------------------------------------------------------------
 
-async function call<T>(url: string, authorization: string, method = "GET", body?: unknown): Promise<T> {
+/** fetch, retried up to three times after 429 and, for GET only, after a 5xx: a repeated POST could book twice. */
+export async function request(url: string, method: string, headers: Record<string, string>, body?: string): Promise<Response> {
   for (let attempt = 1; ; attempt++) {
-    const response = await fetch(url, {
-      method,
-      headers: {
-        authorization,
-        accept: "application/json",
-        "user-agent": "tempo_timesheet_drafter",
-        ...(body === undefined ? {} : { "content-type": "application/json" }),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    const response = await fetch(url, { method, headers: { "user-agent": "tempo_timesheet_drafter", ...headers }, body });
     const retry = response.status === 429 || (response.status >= 500 && method === "GET");
-    if (retry && attempt <= 3) {
-      await new Promise((resolve) => setTimeout(resolve, attempt * (response.status === 429 ? 1000 : 5000)));
-      continue;
-    }
-    const text = await response.text();
-    if (!response.ok) {
-      throw Object.assign(new Error(`${method} ${new URL(url).pathname} failed with ${response.status}: ${text.slice(0, 300)}`), { status: response.status });
-    }
-    return (text ? JSON.parse(text) : undefined) as T;
+    if (!retry || attempt > 3) return response;
+    await new Promise((resolve) => setTimeout(resolve, attempt * (response.status === 429 ? 1000 : 5000)));
   }
+}
+
+async function call<T>(url: string, authorization: string, method = "GET", body?: unknown): Promise<T> {
+  const json: Record<string, string> = body === undefined ? {} : { "content-type": "application/json" };
+  const response = await request(url, method, { authorization, accept: "application/json", ...json }, body === undefined ? undefined : JSON.stringify(body));
+  const text = await response.text();
+  if (!response.ok) {
+    throw Object.assign(new Error(`${method} ${new URL(url).pathname} failed with ${response.status}: ${text.slice(0, 300)}`), { status: response.status });
+  }
+  return (text ? JSON.parse(text) : undefined) as T;
 }
 
 function tempo<T>(path: string, method?: string, body?: unknown): Promise<T> {
@@ -1184,7 +1179,8 @@ async function calendar(from: string, to: string, warnings: string[]): Promise<C
     warnings.push("CALENDAR_ICS_URL is not set, so meetings are missing. See README.md.");
     return [];
   }
-  const response = await fetch(url.replace(/^webcal:/i, "https:"));
+  // The address is a secret link, so the error leaves it out.
+  const response = await request(url.replace(/^webcal:/i, "https:"), "GET", {});
   if (!response.ok) throw new Error(`Downloading the calendar failed with ${response.status}.`);
   const events = parseCalendar(Buffer.from(await response.arrayBuffer()), from, to, process.env.ATLASSIAN_EMAIL);
   if (events.length >= 3 && events.every((event) => PLACEHOLDER_TITLES.has(event.title.toLowerCase()))) {

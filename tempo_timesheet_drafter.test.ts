@@ -38,6 +38,7 @@ import {
     planDays,
     pullRequestActivities,
     pullRequestEvents,
+    request,
     statusLine,
     summaryLine,
     viewsIn,
@@ -650,6 +651,25 @@ test('summaryLine after a failure keeps what the other sources brought and marks
 
     // Assert
     assert.equal(line, '✗ Fetch failed: Tempo 23 worklogs · Jira ✗ · Calendar … · GitHub … · 12s');
+});
+
+test('request retries after 429 with the user agent, but never repeats a POST after a 5xx', async (context) => {
+
+    // Arrange
+    const statuses = [429, 200, 503];
+    const seen: Array<string> = [];
+    context.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => {
+        seen.push(`${init.method} ${(init.headers as Record<string, string>)['user-agent']}`);
+        return new Response('', { status: statuses.shift() });
+    });
+
+    // Act
+    const get = await request('https://example.test/a', 'GET', {});
+    const post = await request('https://example.test/b', 'POST', {}, '{}');
+
+    // Assert
+    assert.deepEqual([get.status, post.status], [200, 503]);
+    assert.deepEqual(seen, ['GET tempo_timesheet_drafter', 'GET tempo_timesheet_drafter', 'POST tempo_timesheet_drafter']);
 });
 
 test('jiraActivities keeps what the account did in the range: creations, all comments and changes once per field', () => {
