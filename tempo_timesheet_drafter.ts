@@ -48,6 +48,14 @@ export interface View {
   summary: string;
 }
 
+/** A note under a day: "?" needs an answer, "!" names missing hours, "·" says where lines come from. */
+export type Mark = "?" | "!" | "·";
+
+export interface Note {
+  mark: Mark;
+  text: string;
+}
+
 export interface CalendarEvent {
   date: string;
   start: number;
@@ -1167,9 +1175,9 @@ export function planDay(
   projects: Set<string>,
   views: View[] = [],
   now = new Date(),
-): { entries: Entry[]; notes: string[] } {
+): { entries: Entry[]; notes: Note[] } {
   const entries: Entry[] = [];
-  const notes: string[] = [];
+  const notes: Note[] = [];
   const occupied: [number, number][] = existing.map((entry) => [entry.start, entry.start + entry.minutes]);
   const overlaps = (start: number, end: number) => occupied.some(([from, to]) => from < end && start < to);
   const required = Math.round(day.requiredSeconds / 60);
@@ -1295,17 +1303,17 @@ export function planDay(
   const unplaced = [...byIssue.keys()].filter((issue) => !placed.has(issue));
   if (unplaced.length) {
     const more = unplaced.length > 10 ? ` and ${unplaced.length - 10} more` : "";
-    notes.push(`? also active on ${unplaced.slice(0, 10).join(", ")}${more} (during meetings or in a busier quarter-hour)`);
+    notes.push({ mark: "?", text: `also active on ${unplaced.slice(0, 10).join(", ")}${more} (during meetings or in a busier quarter-hour)` });
   }
   const keyless = activities.filter((activity) => !activity.issue);
   if (keyless.length) {
     const pullRequests = new Set(keyless.filter((activity) => activity.kind.startsWith("pr-")).map((activity) => activity.text)).size;
     const commits = keyless.filter((activity) => !activity.kind.startsWith("pr-")).length;
     const counts = [commits && `${commits} commit(s)`, pullRequests && `${pullRequests} pull request(s)`].filter(Boolean).join(", ");
-    notes.push(`? ${counts} without issue key: ${shorten([...new Set(keyless.map((activity) => activity.text))].join("; "), 120)}`);
+    notes.push({ mark: "?", text: `${counts} without issue key: ${shorten([...new Set(keyless.map((activity) => activity.text))].join("; "), 120)}` });
   }
   for (const activity of activities.filter((each) => each.batch && placed.has(each.issue!))) {
-    notes.push(`· batch: ${clock(activity.time)} ${activity.issue} for ${activity.text} of ${shorten(activity.batch!.join(", "), 100)}`);
+    notes.push({ mark: "·", text: `batch: ${clock(activity.time)} ${activity.issue} for ${activity.text} of ${shorten(activity.batch!.join(", "), 100)}` });
   }
   const spansFromViews: { start: number; end: number; issue: string }[] = [];
   for (const slot of [...fromViews].sort((a, b) => a - b)) {
@@ -1315,7 +1323,7 @@ export function planDay(
   }
   if (spansFromViews.length) {
     const text = spansFromViews.map(({ start, end, issue }) => `${clock(start * STEP)}${end - start > 1 ? `–${clock(end * STEP)}` : ""} ${issue}`);
-    notes.push(`· viewed: ${text.join(", ")}`);
+    notes.push({ mark: "·", text: `viewed: ${text.join(", ")}` });
   }
 
   const drafted = entries.reduce((sum, entry) => sum + entry.minutes, 0);
@@ -1327,8 +1335,8 @@ export function planDay(
     if (start - end >= STEP) gaps.push(`${clock(end)}–${clock(start)}`);
     end = Math.max(end, stop);
   }
-  if (!entries.length && open > 0) notes.push(`? no activity found, ${duration(open)} open. What was it?`);
-  else if (entries.length && open > 0) notes.push(`! ${duration(open)} short of ${duration(required)}${gaps.length ? `; gaps ${gaps.join(", ")}` : ""}. Anything to add?`);
+  if (!entries.length && open > 0) notes.push({ mark: "?", text: `no activity found, ${duration(open)} open. What was it?` });
+  else if (entries.length && open > 0) notes.push({ mark: "!", text: `${duration(open)} short of ${duration(required)}${gaps.length ? `; gaps ${gaps.join(", ")}` : ""}. Anything to add?` });
   return { entries: entries.sort((a, b) => a.start - b.start), notes };
 }
 
@@ -1520,17 +1528,21 @@ function flow(pieces: { text: string; painted: string }[], width: number, first:
 
 type Rgb = [number, number, number];
 
-// Okabe-Ito: distinguishable with color vision deficiencies.
-const COLOR: Record<"jira" | "meeting" | "code" | "unknown" | "question" | "done" | "dim" | "faint", Rgb> = {
+// Okabe-Ito: distinguishable with color vision deficiencies. The sources of the lines first, then the roles.
+const COLOR = {
   jira: [86, 180, 233],
   meeting: [230, 159, 0],
-  code: [0, 158, 115],
+  github: [0, 158, 115],
   unknown: [204, 121, 167],
-  question: [213, 94, 0],
+  /** Questions, today, now, failures. */
+  attention: [213, 94, 0],
+  /** Missing hours, overlaps, optional settings. */
+  warning: [230, 159, 0],
   done: [0, 158, 115],
+  command: [0, 158, 115],
   dim: [150, 150, 150],
   faint: [95, 95, 95],
-};
+} satisfies Record<string, Rgb>;
 
 /**
  * A person at a terminal gets color and wrapped lines; agents (which read 2D layouts poorly and pay for every escape
@@ -1634,7 +1646,7 @@ interface DayPlan {
   holiday?: string;
   booked: Entry[];
   entries: Entry[];
-  notes: string[];
+  notes: Note[];
 }
 
 /** The Jira address of a key whose project is in `projects`, for linking keys in free text. */
@@ -1664,24 +1676,26 @@ function dayLinks(days: DayPlan[], projects: Set<string>, site: string | undefin
   return issueUrl(site, new Set([...projects, ...issues.map((entry) => entry.issue.slice(0, entry.issue.lastIndexOf("-")))]));
 }
 
-const NOTE_ORDER = ["?", "!", "·"];
+const NOTE_ORDER: Mark[] = ["?", "!", "·"];
 
 /** Questions, then missing hours, then where the lines come from; each names its line by time or key. */
-export function dayNotes(entries: Entry[], notes: string[]): string[] {
-  const result = entries.filter((entry) => entry.question).map((entry) => `? ${clock(entry.start)} ${entry.issue === "?" ? entry.description : entry.issue}: ${entry.question}`);
+export function dayNotes(entries: Entry[], notes: Note[]): Note[] {
+  const result = entries
+    .filter((entry) => entry.question)
+    .map((entry): Note => ({ mark: "?", text: `${clock(entry.start)} ${entry.issue === "?" ? entry.description : entry.issue}: ${entry.question}` }));
   result.push(...notes);
   const meetings = entries.filter((entry) => entry.meeting).map((entry) => `${clock(entry.start)} ${entry.issue}`);
-  if (meetings.length) result.push(`· calendar: ${meetings.join(", ")}`);
+  if (meetings.length) result.push({ mark: "·", text: `calendar: ${meetings.join(", ")}` });
   const evidence = new Map<string, string>();
   for (const entry of entries) if (entry.evidence && !evidence.has(entry.issue)) evidence.set(entry.issue, entry.evidence);
-  for (const [issue, text] of evidence) result.push(`· ${issue}: ${text}`);
-  return result.sort((a, b) => NOTE_ORDER.indexOf(a[0]) - NOTE_ORDER.indexOf(b[0]));
+  for (const [issue, text] of evidence) result.push({ mark: "·", text: `${issue}: ${text}` });
+  return result.sort((a, b) => NOTE_ORDER.indexOf(a.mark) - NOTE_ORDER.indexOf(b.mark));
 }
 
 function kindColor(entry: Entry): Rgb {
   if (entry.issue === "?") return COLOR.unknown;
   if (entry.meeting) return COLOR.meeting;
-  return entry.evidence ? COLOR.code : COLOR.jira;
+  return entry.evidence ? COLOR.github : COLOR.jira;
 }
 
 /** Cells of a `cells` long rule filled for `done` of `required` minutes; full from the required hours on. */
@@ -1702,7 +1716,7 @@ function dayHeader(date: string, done: number, required: number, holiday: string
   // Plain output keeps a plain rule, so a file for book stays as it was.
   const filled = tty ? filledCells(done, required, rule) : 0;
   return (
-    `${paint(HEADER_LEAD, COLOR.faint)}${paint(name, date === today ? COLOR.question : undefined, { bold: true })} ` +
+    `${paint(HEADER_LEAD, COLOR.faint)}${paint(name, date === today ? COLOR.attention : undefined, { bold: true })} ` +
     `${paint("━".repeat(filled), done >= required ? COLOR.done : COLOR.dim)}${paint("─".repeat(rule - filled), COLOR.faint)} ` +
     `${paint(amount, holiday ? COLOR.dim : done >= required ? COLOR.done : undefined, { bold: true })}${paint(" ──", COLOR.faint)}`
   );
@@ -1776,8 +1790,8 @@ function printDraft({ tty, now, site }: Screen, range: string, days: DayPlan[], 
   const piece = (text: string, painted = paint(text, COLOR.dim)) => ({ text, painted });
   const legendIndent = paint("#         ", COLOR.faint);
   const marks: [string, Rgb, string][] = [
-    ["?", COLOR.question, "needs an answer, "],
-    ["!", COLOR.meeting, "hours short, "],
+    ["?", COLOR.attention, "needs an answer, "],
+    ["!", COLOR.warning, "hours short, "],
     ["✓", COLOR.dim, "booked, "],
     ["·", COLOR.dim, "where lines come from"],
   ];
@@ -1791,7 +1805,7 @@ function printDraft({ tty, now, site }: Screen, range: string, days: DayPlan[], 
   );
   // The key colors only exist with colors; without them that line would explain nothing.
   if (tty && tty.depth > 1) {
-    const keys: [string, Rgb][] = [["Jira", COLOR.jira], ["meeting", COLOR.meeting], ["GitHub", COLOR.code], ["? no issue", COLOR.unknown]];
+    const keys: [string, Rgb][] = [["Jira", COLOR.jira], ["meeting", COLOR.meeting], ["GitHub", COLOR.github], ["? no issue", COLOR.unknown]];
     out[out.length - 1] += paint(",", COLOR.dim);
     out.push(...flow(keys.map(([name, color], index) => piece(`${name}${index < keys.length - 1 ? ", " : ""}`, `${paint(name, color, { bold: true })}${index < keys.length - 1 ? paint(", ", COLOR.dim) : ""}`)), width, legendIndent, legendIndent));
   }
@@ -1811,10 +1825,7 @@ function printDraft({ tty, now, site }: Screen, range: string, days: DayPlan[], 
     for (const { entry, booked } of lines.sort((a, b) => a.entry.start - b.entry.start)) entryLine(entry, booked);
     const notes = dayNotes(day.entries, day.notes);
     if (notes.length) gap();
-    for (const note of notes) {
-      const mark = note[0];
-      comment(note.slice(2), mark, mark === "?" ? COLOR.question : mark === "!" ? COLOR.meeting : COLOR.dim);
-    }
+    for (const { mark, text } of notes) comment(text, mark, mark === "?" ? COLOR.attention : mark === "!" ? COLOR.warning : COLOR.dim);
   }
   if (warnings.length) out.push(paint("#", COLOR.faint));
   for (const warning of warnings) comment(`warning: ${warning}`);
@@ -1974,7 +1985,7 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
     const amount = day.holiday ? [day.holiday, hours].filter(Boolean).join(" · ") : hours;
     const label = fitBoth(name, amount, columnWidth);
     put(xs[index] - 1, 0, "│", { fg: COLOR.faint });
-    text(xs[index], 0, label, { bold: true, fg: day.date === today ? COLOR.question : day.holiday ? COLOR.dim : undefined });
+    text(xs[index], 0, label, { bold: true, fg: day.date === today ? COLOR.attention : day.holiday ? COLOR.dim : undefined });
     if (amount && label.endsWith(amount)) text(xs[index] + columnWidth - textWidth(amount), 0, amount, { bold: true, fg: day.holiday ? COLOR.dim : full ? COLOR.done : undefined });
     // The rule under the day fills like the list's header rule.
     const filled = filledCells(done, day.required, columnWidth);
@@ -2012,7 +2023,7 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
       // Full source color: dimmed tints measured worse contrast and looked muddy. Booked blocks are muted toward gray,
       // like the gray booked lines of the list. The entry running now takes the color of the now line.
       const running = day.date === today && item.start <= minute && minute < item.start + item.minutes;
-      const accent = running ? COLOR.question : kindColor(item);
+      const accent = running ? COLOR.attention : kindColor(item);
       const bg = color ? (item.booked && !running ? mix(accent, [128, 128, 128], 0.45) : accent) : undefined;
       const fg = bg ? textOn(bg) : undefined;
       // With 16 colors the darker shade maps back to the block color, so the stripe turns black.
@@ -2050,21 +2061,21 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
   if (todayIndex >= 0 && minute >= hours[0] * 60 && minute < hours[1] * 60) {
     const row = Math.floor(((minute - hours[0] * 60) * ROWS_PER_HOUR) / 60);
     const rowStart = hours[0] * 60 + (row * 60) / ROWS_PER_HOUR;
-    text(0, top + row, clock(rowStart % 60 === 0 ? rowStart : minute), { fg: COLOR.question, bold: true });
+    text(0, top + row, clock(rowStart % 60 === 0 ? rowStart : minute), { fg: COLOR.attention, bold: true });
     // Blocks keep their text; the one running now is orange instead.
-    for (let dx = 0; dx < columnWidth; dx++) if (!at(xs[todayIndex] + dx, top + row).block) put(xs[todayIndex] + dx, top + row, "─", { fg: COLOR.question });
+    for (let dx = 0; dx < columnWidth; dx++) if (!at(xs[todayIndex] + dx, top + row).block) put(xs[todayIndex] + dx, top + row, "─", { fg: COLOR.attention });
   }
 
   const out: string[] = [];
   const piece = (text: string, painted = paint(text, COLOR.dim)) => ({ text, painted });
   out.push("", ...flow([piece(`Draft ${range}`, paint(`Draft ${range}`, undefined, { bold: true })), ...subtitle.split(/(?<= )/).map((word) => piece(word))], width, "", "  "), "");
-  const legend: [string, Rgb][] = [["Jira", COLOR.jira], ["meeting", COLOR.meeting], ["GitHub", COLOR.code], ["? no issue", COLOR.unknown]];
+  const legend: [string, Rgb][] = [["Jira", COLOR.jira], ["meeting", COLOR.meeting], ["GitHub", COLOR.github], ["? no issue", COLOR.unknown]];
   out.push(
     ...flow(
       [
         ...legend.map(([name, rgb]) => piece(`▌ ${name}   `, `${paint("▌", rgb)} ${paint(name, COLOR.dim)}   `)),
         piece("✓ booked   "),
-        piece("─ now", `${paint("─", COLOR.question)} ${paint("now", COLOR.dim)}`),
+        piece("─ now", `${paint("─", COLOR.attention)} ${paint("now", COLOR.dim)}`),
       ],
       width,
       "",
@@ -2081,17 +2092,17 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
     out.push("", paint("Not in the grid (outside the hours or too many overlaps):", COLOR.dim));
     for (const item of hiddenItems.sort((a, b) => a.date.localeCompare(b.date) || a.start - b.start)) out.push(listed(item));
   }
-  const open = shown.map((day) => ({ day, notes: dayNotes(day.entries, day.notes).filter((note) => note[0] !== "·") })).filter(({ notes }) => notes.length);
+  const open = shown.map((day) => ({ day, notes: dayNotes(day.entries, day.notes).filter((note) => note.mark !== "·") })).filter(({ notes }) => notes.length);
   for (const { day, notes } of open) {
-    out.push("", paint(`${weekday(day.date)[0].toUpperCase()}${weekday(day.date).slice(1)} ${day.date}`, day.date === today ? COLOR.question : undefined, { bold: true }));
+    out.push("", paint(`${weekday(day.date)[0].toUpperCase()}${weekday(day.date).slice(1)} ${day.date}`, day.date === today ? COLOR.attention : undefined, { bold: true }));
     for (const note of notes) {
-      wrapWords(note.slice(2), Math.max(20, Math.min(width, 120) - 4)).forEach((part, index) => {
-        const mark = index ? " " : note[0];
-        out.push(`  ${paint(mark, note[0] === "?" ? COLOR.question : COLOR.meeting, { bold: true })} ${withKeys(part, COLOR.dim)}`);
+      wrapWords(note.text, Math.max(20, Math.min(width, 120) - 4)).forEach((part, index) => {
+        const mark = index ? " " : note.mark;
+        out.push(`  ${paint(mark, note.mark === "?" ? COLOR.attention : COLOR.warning, { bold: true })} ${withKeys(part, COLOR.dim)}`);
       });
     }
   }
-  for (const warning of warnings) out.push(paint(`warning: ${warning}`, COLOR.question));
+  for (const warning of warnings) out.push(paint(`warning: ${warning}`, COLOR.attention));
   out.push("", ...wrapWords("The lines to book: add --list. Agents and pipes get them without it.", width).map((line) => paint(line, COLOR.dim)), "");
   console.log(out.join("\n"));
 }
@@ -2166,7 +2177,7 @@ function progress(steps: Record<string, number>) {
   const find = (name: string) => sources.find((source) => source.name === name)!;
   const started = Date.now();
   const depth = active ? process.stderr.getColorDepth() : 1;
-  const markColor = (mark: string) => (mark === "✓" ? COLOR.done : mark === "✗" ? COLOR.question : COLOR.jira);
+  const markColor = (mark: string) => (mark === "✓" ? COLOR.done : mark === "✗" ? COLOR.attention : COLOR.jira);
   const paint = (text: string) =>
     depth > 1 ? text.replace(new RegExp(`[✓✗${SPINNER}]`, "g"), (mark) => `\x1b[${colorCode(markColor(mark), depth)}m${mark}\x1b[0m`) : text;
   let shown = "";
@@ -2248,8 +2259,8 @@ function demo(view: ViewName | undefined, now: Date): void {
           entry(mon, "15:15", 45, "TEAM-2", "Weekly sync", { meeting: true }),
         ],
         notes: [
-          "? also active on SHOP-120, SHOP-133, SHOP-134, SHOP-135, SHOP-138, SHOP-141, SHOP-144, SHOP-147, SHOP-149 (during meetings or in a busier quarter-hour)",
-          "! 30m short of 7h; gaps 12:15–13:15. Anything to add?",
+          { mark: "?", text: "also active on SHOP-120, SHOP-133, SHOP-134, SHOP-135, SHOP-138, SHOP-141, SHOP-144, SHOP-147, SHOP-149 (during meetings or in a busier quarter-hour)" },
+          { mark: "!", text: "30m short of 7h; gaps 12:15–13:15. Anything to add?" },
         ],
       },
       {
@@ -2264,9 +2275,9 @@ function demo(view: ViewName | undefined, now: Date): void {
           entry(tue, "13:00", 75, "SHOP-160", "Review", { evidence: "PR #318 Show the delivery date in the cart; Merge pull request #318 from shop/issue/SHOP-160" }),
         ],
         notes: [
-          "? 2 commit(s), 1 pull request(s) without issue key: Bump dependencies; Fix typo in README; PR #77 Update the CI",
-          "! 3h30m short of 7h; gaps 09:45–10:00, 11:00–13:00. Anything to add?",
-          "· batch: 09:41 SHOP-93 for resolution, status of SHOP-90, SHOP-91, SHOP-92, SHOP-93, SHOP-94, SHOP-95, SHOP-96, SHOP-97, SHOP-98",
+          { mark: "?", text: "2 commit(s), 1 pull request(s) without issue key: Bump dependencies; Fix typo in README; PR #77 Update the CI" },
+          { mark: "!", text: "3h30m short of 7h; gaps 09:45–10:00, 11:00–13:00. Anything to add?" },
+          { mark: "·", text: "batch: 09:41 SHOP-93 for resolution, status of SHOP-90, SHOP-91, SHOP-92, SHOP-93, SHOP-94, SHOP-95, SHOP-96, SHOP-97, SHOP-98" },
         ],
       },
       { date: wed, required: 0, holiday: "Feiertag (demo)", booked: [], entries: [], notes: [] },
@@ -2281,7 +2292,7 @@ function demo(view: ViewName | undefined, now: Date): void {
           }),
           entry(thu, "13:00", 45, "SHOP-171", "Versandkosten je Region im Warenkorb anzeigen"),
         ],
-        notes: ["! 2h45m short of 7h. Anything to add?", "· viewed: 13:00–13:45 SHOP-171"],
+        notes: [{ mark: "!", text: "2h45m short of 7h. Anything to add?" }, { mark: "·", text: "viewed: 13:00–13:45 SHOP-171" }],
       },
     ],
     [],
@@ -2452,7 +2463,7 @@ async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> 
   comment(dryRun ? `Dry run ${range}: every line checked, nothing will be booked.` : `Booking ${range} in Tempo.`);
   // Before posting, so an overlap is visible while it can still be stopped.
   if (warnings.length) gap();
-  for (const warning of warnings) comment(warning, "!", COLOR.meeting);
+  for (const warning of warnings) comment(warning, "!", COLOR.warning);
   let added = 0;
   let failed = 0;
   for (const date of dates) {
@@ -2487,17 +2498,17 @@ async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> 
         added++;
       } catch (error) {
         failed++;
-        line(entry, "FAILED", COLOR.question);
+        line(entry, "FAILED", COLOR.attention);
         failures.push(`line ${entry.line}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     if (failures.length) gap();
-    for (const failure of failures) comment(failure, "✗", COLOR.question);
+    for (const failure of failures) comment(failure, "✗", COLOR.attention);
   }
   const skipped = planned.filter((entry) => entry.duplicate).length;
   gap();
   const summary = dryRun ? `Dry run: ${added} to book, ${skipped} skipped. Nothing was booked.` : `${added} booked, ${skipped} skipped, ${failed} failed.`;
-  say(`${paint("# ", COLOR.faint)}${paint(summary, failed ? COLOR.question : undefined, { bold: true })}`);
+  say(`${paint("# ", COLOR.faint)}${paint(summary, failed ? COLOR.attention : undefined, { bold: true })}`);
   if (Number.isFinite(width)) say();
   return failed === 0;
 }
@@ -2507,12 +2518,12 @@ async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> 
 function helpText(command: string | undefined, tty: Tty | undefined, now: Date, env: NodeJS.ProcessEnv): string {
   const paint = painter(tty);
   const heading = (text: string) => paint(text, undefined, { bold: true });
-  const name = (text: string) => paint(text, COLOR.code, { bold: true });
+  const name = (text: string) => paint(text, COLOR.command, { bold: true });
   const dim = (text: string) => paint(text, COLOR.dim);
   const today = localDate(now);
   const [monday, sunday] = parseRange("week", today);
   const day = `${weekday(today)[0].toUpperCase()}${weekday(today).slice(1)}`;
-  const todayLine = `Today is ${paint(`${day} ${today}`, COLOR.question, { bold: true })}: week = kw${isoWeek(today)} = ${monday}..${sunday}.`;
+  const todayLine = `Today is ${paint(`${day} ${today}`, COLOR.attention, { bold: true })}: week = kw${isoWeek(today)} = ${monday}..${sunday}.`;
   const ranges = [
     "today (or day), yesterday, week, last-week, kw45, 2026-11-03,",
     "2026-11-02..2026-11-04; also heute, gestern, woche, letzte-woche.",
@@ -2550,7 +2561,7 @@ function helpText(command: string | undefined, tty: Tty | undefined, now: Date, 
       "",
       heading(USAGE_BOOK),
       "",
-      `Books draft lines in Tempo. ${paint("WRITES worklogs", COLOR.question, { bold: true })}: use only approved lines.`,
+      `Books draft lines in Tempo. ${paint("WRITES worklogs", COLOR.attention, { bold: true })}: use only approved lines.`,
       "Reads <file>, or stdin without it. Lines starting with # are skipped.",
       "",
       `  ${name("--dry-run")}   check every line and show what would be booked; books nothing`,
@@ -2596,7 +2607,7 @@ function helpText(command: string | undefined, tty: Tty | undefined, now: Date, 
   const shownValue = (variable: string) => (["ATLASSIAN_SITE", "GITHUB_OWNERS"].includes(variable) ? (env[variable] ?? "") : "");
   const setup = variables.map(([variable, required, note]) => {
     const set = Boolean(env[variable]);
-    const status = set ? paint("set    ", COLOR.done) : required ? paint("missing", COLOR.question, { bold: true }) : paint("missing", COLOR.meeting);
+    const status = set ? paint("set    ", COLOR.done) : required ? paint("missing", COLOR.attention, { bold: true }) : paint("missing", COLOR.warning);
     return `  ${variable.padEnd(20)} ${status}  ${dim(set ? shownValue(variable) : note)}`.trimEnd();
   });
   return [
@@ -2608,7 +2619,7 @@ function helpText(command: string | undefined, tty: Tty | undefined, now: Date, 
     "",
     heading("Usage:"),
     `  node . ${name("draft")} <range> [--grid|--list]  draft worklogs ${dim("(read-only)")}`,
-    `  node . ${name("book")} [--dry-run] [<file>]      book draft lines ${paint("(WRITES to Tempo)", COLOR.question, { bold: true })}`,
+    `  node . ${name("book")} [--dry-run] [<file>]      book draft lines ${paint("(WRITES to Tempo)", COLOR.attention, { bold: true })}`,
     `  node . ${name("demo")} [--grid|--list]           made-up week ${dim("(no API calls)")}`,
     `  node . ${name("help")} [<command>]               this help, or help for a command`,
     "",

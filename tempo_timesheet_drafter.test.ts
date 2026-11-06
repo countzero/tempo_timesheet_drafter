@@ -38,7 +38,7 @@ import {
     wrapFit,
     wrapWords,
 } from './tempo_timesheet_drafter.ts';
-import type { Activity, Booked, CalendarEvent, Commit, Day, Entry, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View } from './tempo_timesheet_drafter.ts';
+import type { Activity, Booked, CalendarEvent, Commit, Day, Entry, Mark, Note, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View } from './tempo_timesheet_drafter.ts';
 
 // Local time decides the day and the quarter-hours; a fixed zone gives the same results on every machine and in CI.
 process.env.TZ = 'Europe/Berlin';
@@ -65,6 +65,17 @@ function spans (entries: Array<{ start: number, minutes: number, issue: string }
 
     const clock = (minutes: number) => `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
     return entries.map((entry) => `${clock(entry.start)}–${clock(entry.start + entry.minutes)} ${entry.issue}`);
+}
+
+/** Notes as the list prints them, mark first. */
+function said (notes: Array<Note>): Array<string> {
+
+    return notes.map((each) => `${each.mark} ${each.text}`);
+}
+
+function note (text: string): Note {
+
+    return { mark: text[0] as Mark, text: text.slice(2) };
 }
 
 function calendar (...lines: Array<string>): Buffer {
@@ -297,7 +308,7 @@ test('planDay books a batch on the named issue and lists the others', () => {
 
     // Assert
     assert.deepEqual(spans(entries), ['17:00–17:15 SHOP-2']);
-    assert.ok(notes.includes('· batch: 17:10 SHOP-2 for resolution, status of SHOP-2, SHOP-3, SHOP-4'));
+    assert.ok(said(notes).includes('· batch: 17:10 SHOP-2 for resolution, status of SHOP-2, SHOP-3, SHOP-4'));
 });
 
 test('planDay gives a gap of up to 45 minutes to the issue after it and leaves a longer gap open', () => {
@@ -323,7 +334,7 @@ test('planDay places meetings at their time and gives activity during a meeting 
 
     // Assert
     assert.deepEqual(spans(entries), ['09:15–09:30 SHOP-1', '09:30–10:00 TEAM-1', '10:00–10:15 SHOP-1']);
-    assert.ok(notes.some((note) => note.includes('also active on SHOP-2')));
+    assert.ok(said(notes).some((note) => note.includes('also active on SHOP-2')));
 });
 
 test('planDay gives the quarter-hour to the issue with the highest weight', () => {
@@ -382,7 +393,7 @@ test('planDay fills open quarter-hours after a view, from the end of the meeting
     // Assert
     assert.deepEqual(spans(entries), ['10:30–11:00 TEAM-1', '11:00–12:00 SHOP-5', '13:00–13:15 SHOP-6']);
     assert.equal(entries[1].description, 'Show the shipping costs');
-    assert.ok(notes.includes('· viewed: 11:00–12:00 SHOP-5'));
+    assert.ok(said(notes).includes('· viewed: 11:00–12:00 SHOP-5'));
 });
 
 test('planDay ignores issues viewed together within a minute', () => {
@@ -510,7 +521,7 @@ test('planDay lists a pull request without issue key once, however often it was 
     const { notes } = planDay(DAY, [], activities, [], PROJECTS);
 
     // Assert
-    assert.ok(notes.includes('? 1 commit(s), 1 pull request(s) without issue key: Bump; PR #4 Docs'));
+    assert.ok(said(notes).includes('? 1 commit(s), 1 pull request(s) without issue key: Bump; PR #4 Docs'));
 });
 
 function source (name: string, overrides: Partial<Source> = {}): Source {
@@ -661,10 +672,10 @@ test('dayNotes puts questions first, then missing hours, then the sources of the
     ];
 
     // Act
-    const notes = dayNotes(entries, ['· batch: 17:10 SHOP-2', '! 30m short of 7h', '? also active on SHOP-3']);
+    const notes = dayNotes(entries, ['· batch: 17:10 SHOP-2', '! 30m short of 7h', '? also active on SHOP-3'].map(note));
 
     // Assert
-    assert.deepEqual(notes, [
+    assert.deepEqual(said(notes), [
         '? 10:00 Kundentermin: Which issue?',
         '? also active on SHOP-3',
         '! 30m short of 7h',
