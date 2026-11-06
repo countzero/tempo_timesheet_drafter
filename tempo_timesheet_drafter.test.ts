@@ -10,6 +10,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import {
+    authoredIn,
+    bookedEntry,
     classify,
     closest,
     collapseBatches,
@@ -24,6 +26,7 @@ import {
     isoWeek,
     issueKey,
     issueUrl,
+    jiraActivities,
     keyPieces,
     lanes,
     layoutGrid,
@@ -37,11 +40,12 @@ import {
     pullRequestEvents,
     statusLine,
     summaryLine,
+    viewsIn,
     withoutKey,
     wrapFit,
     wrapWords,
 } from './tempo_timesheet_drafter.ts';
-import type { Activity, Booked, CalendarEvent, Cell, Commit, Day, DayPlan, DraftLine, Entry, Mark, Note, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View } from './tempo_timesheet_drafter.ts';
+import type { Activity, Booked, CalendarEvent, Cell, ChangeLog, Commit, Day, DayPlan, DraftLine, Entry, JiraIssue, Mark, Note, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View, ViewedIssue } from './tempo_timesheet_drafter.ts';
 
 // Local time decides the day and the quarter-hours; a fixed zone gives the same results on every machine and in CI.
 process.env.TZ = 'Europe/Berlin';
@@ -646,6 +650,79 @@ test('summaryLine after a failure keeps what the other sources brought and marks
 
     // Assert
     assert.equal(line, '✗ Fetch failed: Tempo 23 worklogs · Jira ✗ · Calendar … · GitHub … · 12s');
+});
+
+test('jiraActivities keeps what the account did in the range: creations, all comments and changes once per field', () => {
+
+    // Arrange
+    const me = { accountId: 'me' };
+    const other = { accountId: 'other' };
+    const issue: JiraIssue = {
+        id: '10',
+        key: 'SHOP-1',
+        fields: {
+            summary: 'Checkout',
+            created: `${DAY.date}T08:00:00+01:00`,
+            creator: me,
+            parent: { key: 'SHOP-0', fields: { summary: 'Epic' } },
+            comment: { total: 3, comments: [{ created: `${DAY.date}T08:30:00+01:00`, author: me }] },
+        },
+    };
+    const more = new Map([['SHOP-1', [
+        { created: `${DAY.date}T08:30:00+01:00`, author: me },
+        { created: `${DAY.date}T09:00:00+01:00`, author: other },
+        { created: '2026-11-04T09:00:00+01:00', author: me },
+    ]]]);
+    const logs: Array<ChangeLog> = [{ issueId: 10, changeHistories: [
+        { author: me, created: new Date(`${DAY.date}T10:00:00+01:00`).getTime(), items: [{ field: 'status' }, { field: 'resolution' }, { field: 'status' }] },
+        { author: other, created: new Date(`${DAY.date}T11:00:00+01:00`).getTime(), items: [{ field: 'status' }] },
+    ] }];
+
+    // Act
+    const activities = jiraActivities([issue], more, logs, 'me', DAY.date, DAY.date);
+
+    // Assert
+    assert.deepEqual(activities.map((activity) => [activity.time, activity.text, activity.parent?.key]), [
+        [480, 'created', 'SHOP-0'],
+        [510, 'comment', 'SHOP-0'],
+        [600, 'status, resolution', 'SHOP-0'],
+    ]);
+});
+
+test('viewsIn keeps the views of the range in time order', () => {
+
+    // Arrange
+    const viewed = (key: string, at: string): ViewedIssue => ({ key, fields: { lastViewed: at, summary: key } });
+
+    // Act
+    const views = viewsIn([viewed('SHOP-2', `${DAY.date}T11:00:00+01:00`), viewed('SHOP-1', `${DAY.date}T09:00:00+01:00`), viewed('SHOP-3', '2026-11-04T00:30:00+01:00')], DAY.date, DAY.date);
+
+    // Assert
+    assert.deepEqual(views.map((view) => [view.issue, view.time]), [['SHOP-1', 540], ['SHOP-2', 660]]);
+});
+
+test('bookedEntry names an issue Jira does not know by its id and keeps the first line of the description', () => {
+
+    // Act
+    const entry = bookedEntry(
+        { tempoWorklogId: 1, issue: { id: 7 }, startDate: DAY.date, startTime: '09:30:00', timeSpentSeconds: 1800, description: `${'x'.repeat(70)}\nsecond line` },
+        new Map(),
+    );
+
+    // Assert
+    assert.deepEqual(entry, { date: DAY.date, start: 570, minutes: 30, issue: '#7', issueId: 7, description: 'x'.repeat(60) });
+});
+
+test('authoredIn keeps each commit once and only those authored in the range', () => {
+
+    // Arrange
+    const node = (oid: string, authoredDate: string): Commit => ({ oid, authoredDate, messageHeadline: oid, parents: { totalCount: 1 } });
+
+    // Act
+    const kept = authoredIn([node('a', `${DAY.date}T09:00:00+01:00`), node('a', `${DAY.date}T09:00:00+01:00`), node('b', '2026-11-02T23:30:00+01:00')], DAY.date, DAY.date);
+
+    // Assert
+    assert.deepEqual(kept.map((each) => each.oid), ['a']);
 });
 
 test('commitActivities counts a pull request merge as a review and skips other merges without an issue key', () => {

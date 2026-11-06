@@ -74,7 +74,7 @@ export interface CalendarEvent {
   tentative: boolean;
 }
 
-interface JiraIssue {
+export interface JiraIssue {
   id: string;
   key: string;
   fields: {
@@ -86,7 +86,7 @@ interface JiraIssue {
   };
 }
 
-interface JiraComment {
+export interface JiraComment {
   created: string;
   author?: { accountId: string };
 }
@@ -98,7 +98,7 @@ export interface Day {
   holiday?: { name: string };
 }
 
-interface TempoWorklog {
+export interface TempoWorklog {
   tempoWorklogId: number;
   issue: { id: number };
   startDate: string;
@@ -169,6 +169,10 @@ export class UsageError extends Error {
     this.usage = usage;
     this.hint = hint;
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function env(name: string): string {
@@ -368,17 +372,25 @@ async function projectKeys(): Promise<Set<string>> {
   }
 }
 
+/** Every issue a JQL search finds, page by page. */
+async function searchIssues<T>(jql: string, fields: string[]): Promise<T[]> {
+  const issues: T[] = [];
+  let nextPageToken: string | undefined;
+  do {
+    const page: { issues: T[]; nextPageToken?: string } = await jira("/rest/api/3/search/jql", "POST", { jql, fields, maxResults: 100, nextPageToken });
+    issues.push(...page.issues);
+    nextPageToken = page.nextPageToken;
+  } while (nextPageToken);
+  return issues;
+}
+
 async function issueKeys(ids: number[]): Promise<Map<number, string>> {
   const keys = new Map<number, string>();
   const unique = [...new Set(ids)];
   for (let index = 0; index < unique.length; index += 100) {
-    const chunk = unique.slice(index, index + 100);
-    const page = await jira<{ issues: { id: string; key: string }[] }>("/rest/api/3/search/jql", "POST", {
-      jql: `id in (${chunk.join(",")})`,
-      fields: ["summary"],
-      maxResults: 100,
-    });
-    for (const issue of page.issues) keys.set(Number(issue.id), issue.key);
+    for (const issue of await searchIssues<{ id: string; key: string }>(`id in (${unique.slice(index, index + 100).join(",")})`, ["summary"])) {
+      keys.set(Number(issue.id), issue.key);
+    }
   }
   return keys;
 }
@@ -402,20 +414,39 @@ async function comments(key: string): Promise<JiraComment[]> {
   }
 }
 
-async function jiraActivity(account: string, from: string, to: string): Promise<Activity[]> {
-  const issues: JiraIssue[] = [];
-  let nextPageToken: string | undefined;
-  do {
-    const page: { issues: JiraIssue[]; nextPageToken?: string } = await jira("/rest/api/3/search/jql", "POST", {
-      jql: `issuekey in updatedBy("${account}", "${from}", "${to}")`,
-      fields: ["summary", "created", "creator", "parent", "comment"],
-      maxResults: 100,
-      nextPageToken,
-    });
-    issues.push(...page.issues);
-    nextPageToken = page.nextPageToken;
-  } while (nextPageToken);
+/** The changes of an issue, as `changelog/bulkfetch` returns them (`created` in epoch milliseconds). */
+export interface ChangeLog {
+  issueId: string | number;
+  changeHistories: { author?: { accountId: string }; created: number; items: { field: string }[] }[];
+}
 
+async function changeLogs(issues: JiraIssue[]): Promise<ChangeLog[]> {
+  const logs: ChangeLog[] = [];
+  for (let index = 0; index < issues.length; index += 1000) {
+    let token: string | undefined;
+    do {
+      const page: { issueChangeLogs: ChangeLog[]; nextPageToken?: string } = await jira("/rest/api/3/changelog/bulkfetch", "POST", {
+        issueIdsOrKeys: issues.slice(index, index + 1000).map((issue) => issue.id),
+        maxResults: 1000,
+        nextPageToken: token,
+      });
+      logs.push(...page.issueChangeLogs);
+      token = page.nextPageToken;
+    } while (token);
+  }
+  return logs;
+}
+
+async function jiraActivity(account: string, from: string, to: string): Promise<Activity[]> {
+  const issues = await searchIssues<JiraIssue>(`issuekey in updatedBy("${account}", "${from}", "${to}")`, ["summary", "created", "creator", "parent", "comment"]);
+  // The search lists only the first comments of an issue; the rest come one issue at a time.
+  const more = new Map<string, JiraComment[]>();
+  for (const issue of issues) if ((issue.fields.comment?.total ?? 0) > (issue.fields.comment?.comments.length ?? 0)) more.set(issue.key, await comments(issue.key));
+  return jiraActivities(issues, more, await changeLogs(issues), account, from, to);
+}
+
+/** What the account did to the issues in the range: creations, comments, and changes with their field names. */
+export function jiraActivities(issues: JiraIssue[], more: Map<string, JiraComment[]>, logs: ChangeLog[], account: string, from: string, to: string): Activity[] {
   const result: Activity[] = [];
   const add = (stamp: string | number, issue: JiraIssue, text: string) => {
     const at = new Date(stamp);
@@ -426,52 +457,36 @@ async function jiraActivity(account: string, from: string, to: string): Promise<
   };
   for (const issue of issues) {
     if (issue.fields.creator?.accountId === account) add(issue.fields.created, issue, "created");
-    const listed = issue.fields.comment?.comments ?? [];
-    const all = (issue.fields.comment?.total ?? 0) > listed.length ? await comments(issue.key) : listed;
-    for (const comment of all) if (comment.author?.accountId === account) add(comment.created, issue, "comment");
+    for (const comment of more.get(issue.key) ?? issue.fields.comment?.comments ?? []) if (comment.author?.accountId === account) add(comment.created, issue, "comment");
   }
-
   const byId = new Map(issues.map((issue) => [issue.id, issue]));
-  type Histories = { issueId: string | number; changeHistories: { author?: { accountId: string }; created: number; items: { field: string }[] }[] };
-  for (let index = 0; index < issues.length; index += 1000) {
-    let token: string | undefined;
-    do {
-      const page: { issueChangeLogs: Histories[]; nextPageToken?: string } = await jira("/rest/api/3/changelog/bulkfetch", "POST", {
-        issueIdsOrKeys: issues.slice(index, index + 1000).map((issue) => issue.id),
-        maxResults: 1000,
-        nextPageToken: token,
-      });
-      for (const log of page.issueChangeLogs) {
-        const issue = byId.get(String(log.issueId));
-        for (const history of log.changeHistories) {
-          if (issue && history.author?.accountId === account) add(history.created, issue, [...new Set(history.items.map((item) => item.field))].join(", "));
-        }
-      }
-      token = page.nextPageToken;
-    } while (token);
+  for (const log of logs) {
+    const issue = byId.get(String(log.issueId));
+    for (const history of log.changeHistories) {
+      if (issue && history.author?.accountId === account) add(history.created, issue, [...new Set(history.items.map((item) => item.field))].join(", "));
+    }
   }
   return result;
 }
 
 /** The user's last view per issue in the range; a later view replaces it, so it serves recent days best. */
 async function lastViews(from: string, to: string): Promise<View[]> {
+  return viewsIn(await searchIssues<ViewedIssue>(`lastViewed >= "${from}" AND lastViewed < "${addDays(to, 1)}"`, ["lastViewed", "summary"]), from, to);
+}
+
+export interface ViewedIssue {
+  key: string;
+  fields: { lastViewed: string; summary: string };
+}
+
+/** JQL compares dates in the Jira profile's time zone; the day is the machine's, as for every other source. */
+export function viewsIn(issues: ViewedIssue[], from: string, to: string): View[] {
   const views: View[] = [];
-  let nextPageToken: string | undefined;
-  do {
-    const page: { issues: { key: string; fields: { lastViewed: string; summary: string } }[]; nextPageToken?: string } = await jira("/rest/api/3/search/jql", "POST", {
-      jql: `lastViewed >= "${from}" AND lastViewed < "${addDays(to, 1)}"`,
-      fields: ["lastViewed", "summary"],
-      maxResults: 100,
-      nextPageToken,
-    });
-    for (const issue of page.issues) {
-      const at = new Date(issue.fields.lastViewed);
-      // JQL compares dates in the Jira profile's time zone; the day is the machine's, as for every other source.
-      if (localDate(at) < from || localDate(at) > to) continue;
-      views.push({ date: localDate(at), time: at.getHours() * 60 + at.getMinutes(), ms: at.getTime(), issue: issue.key, summary: issue.fields.summary });
-    }
-    nextPageToken = page.nextPageToken;
-  } while (nextPageToken);
+  for (const issue of issues) {
+    const at = new Date(issue.fields.lastViewed);
+    if (localDate(at) < from || localDate(at) > to) continue;
+    views.push({ date: localDate(at), time: at.getHours() * 60 + at.getMinutes(), ms: at.getTime(), issue: issue.key, summary: issue.fields.summary });
+  }
   return views.sort((a, b) => a.ms - b.ms);
 }
 
@@ -490,20 +505,28 @@ async function booked(account: string, from: string, to: string): Promise<Booked
     path = next.pathname + next.search;
   }
   const keys = worklogs.length ? await issueKeys(worklogs.map((worklog) => worklog.issue.id)) : new Map<number, string>();
-  return worklogs.map((worklog) => ({
+  return worklogs.map((worklog) => bookedEntry(worklog, keys));
+}
+
+/** A Tempo worklog as a line: its key (or #id when Jira does not know it) and the first line of its description. */
+export function bookedEntry(worklog: TempoWorklog, keys: Map<number, string>): Booked {
+  return {
     date: worklog.startDate,
     start: toMinutes(worklog.startTime ?? "00:00"),
     minutes: Math.round(worklog.timeSpentSeconds / 60),
     issue: keys.get(worklog.issue.id) ?? `#${worklog.issue.id}`,
     issueId: worklog.issue.id,
     description: (worklog.description ?? "").split(/\r?\n/)[0].slice(0, 60),
-  }));
+  };
 }
 
 // --- GitHub ---------------------------------------------------------------
 
+/** GitHub's cursor for the next page of a connection. */
+type PageInfo = { hasNextPage: boolean; endCursor: string };
+
 interface HistoryPage {
-  pageInfo: { hasNextPage: boolean; endCursor: string };
+  pageInfo: PageInfo;
   nodes: Commit[];
 }
 
@@ -573,7 +596,7 @@ async function repositories(owner: string, since: string): Promise<string[]> {
   const names: string[] = [];
   let after: string | null = null;
   for (;;) {
-    type Page = { repositoryOwner: { repositories: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: { name: string; pushedAt: string | null }[] } } | null };
+    type Page = { repositoryOwner: { repositories: { pageInfo: PageInfo; nodes: { name: string; pushedAt: string | null }[] } } | null };
     const data: Page = await github<Page>(REPOSITORIES_QUERY, { login: owner, after });
     if (!data.repositoryOwner) throw new Error(`GitHub owner ${owner} not found.`);
     const page = data.repositoryOwner.repositories;
@@ -591,7 +614,7 @@ async function history(repository: string, since: string, author: string): Promi
   // A branch whose last commit is older than `since` holds no newer one; reading only the others saves most requests.
   const recent: string[] = [];
   for (let after: string | null = null; ; ) {
-    type Page = { repository: { refs: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: { name: string; target: { committedDate?: string } }[] } } };
+    type Page = { repository: { refs: { pageInfo: PageInfo; nodes: { name: string; target: { committedDate?: string } }[] } } };
     const data: Page = await github<Page>(BRANCHES_QUERY, { owner, name, after });
     for (const ref of data.repository.refs.nodes) {
       if (!ref.target.committedDate || ref.target.committedDate >= since) recent.push(`refs/heads/${ref.name}`);
@@ -643,13 +666,18 @@ async function commits(
         histories.push(await history(repository, since, viewer.id));
       } catch (error) {
         onRepositories(total, ++skipped);
-        warnings.push(`skipped ${repository}: ${error instanceof Error ? error.message : String(error)}`);
+        warnings.push(`skipped ${repository}: ${errorMessage(error)}`);
       }
     }
   };
   await Promise.all(Array.from({ length: 8 }, worker));
+  return authoredIn(histories.flat(), from, to);
+}
+
+/** Each commit once (a commit on several branches is listed for each), if authored in the range. */
+export function authoredIn(nodes: Commit[], from: string, to: string): Commit[] {
   const seen = new Set<string>();
-  return histories.flat().filter((node) => {
+  return nodes.filter((node) => {
     if (seen.has(node.oid)) return false;
     seen.add(node.oid);
     const date = localDate(new Date(node.authoredDate));
@@ -752,7 +780,7 @@ async function pullRequests(from: string, to: string, viewerRequest: Promise<Vie
     const query = `is:pr reviewed-by:@me ${owner.includes("/") ? "repo" : "user"}:${owner} updated:>=${addDays(from, -SEARCH_LEAD_DAYS)}`;
     try {
       for (let after: string | null = null; ; ) {
-        type Page = { search: { issueCount: number; pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: (ReviewedPullRequest | null)[] } };
+        type Page = { search: { issueCount: number; pageInfo: PageInfo; nodes: (ReviewedPullRequest | null)[] } };
         const data: Page | null = await githubPartial<Page>(REVIEWED_QUERY, { query, after, login }, warnings);
         if (!data) break;
         if (!after && data.search.issueCount > SEARCH_LIMIT) warnings.push(`GitHub: ${data.search.issueCount} reviewed pull requests of ${owner}, only the first ${SEARCH_LIMIT} read`);
@@ -761,13 +789,13 @@ async function pullRequests(from: string, to: string, viewerRequest: Promise<Vie
         after = data.search.pageInfo.endCursor;
       }
     } catch (error) {
-      warnings.push(`skipped reviews of ${owner}: ${error instanceof Error ? error.message : String(error)}`);
+      warnings.push(`skipped reviews of ${owner}: ${errorMessage(error)}`);
     }
   }
   const comments: PullRequestComment[] = [];
   try {
     for (let after: string | null = null; ; ) {
-      type Connection = { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: (PullRequestComment | null)[] };
+      type Connection = { pageInfo: PageInfo; nodes: (PullRequestComment | null)[] };
       const data: { viewer: { issueComments: Connection } } | null = await githubPartial(PULL_REQUEST_COMMENTS_QUERY, { after }, warnings);
       if (!data) break;
       const page: Connection = data.viewer.issueComments;
@@ -778,7 +806,7 @@ async function pullRequests(from: string, to: string, viewerRequest: Promise<Vie
       after = page.pageInfo.endCursor;
     }
   } catch (error) {
-    warnings.push(`skipped pull request comments: ${error instanceof Error ? error.message : String(error)}`);
+    warnings.push(`skipped pull request comments: ${errorMessage(error)}`);
   }
   for (const pullRequest of reviewed.values()) {
     const reviews = pullRequest.reviews;
@@ -2678,7 +2706,7 @@ async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> 
       } catch (error) {
         failed++;
         line(entry, "FAILED", COLOR.attention);
-        failures.push(`line ${entry.line}: ${error instanceof Error ? error.message : String(error)}`);
+        failures.push(`line ${entry.line}: ${errorMessage(error)}`);
       }
     }
     if (failures.length) gap();
@@ -2951,7 +2979,7 @@ function readText(file?: string): string {
 // Only as the program: the tests import the functions without running it.
 if (import.meta.main) {
   main().catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
     const reader = person(process.stderr);
     const red = reader && process.stderr.getColorDepth() > 1;
     const bold = (text: string) => (reader ? `\x1b[1m${text}\x1b[0m` : text);
