@@ -145,9 +145,15 @@ const DAY_CODES = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
 const CANCELLED = /^(abgesagt|canceled|cancelled|annulé|cancelado)\s*:/i;
 const PLACEHOLDER_TITLES = new Set(["", "busy", "beschäftigt", "free", "frei", "tentative", "mit vorbehalt", "away", "abwesend"]);
 
-const USAGE_DRAFT = "node . draft <range> [--grid|--list]";
-const USAGE_BOOK = "node . book [--dry-run] [<file>]";
-const USAGE_DEMO = "node . demo [--grid|--list]";
+/** The commands: usage line, flags, and the summary the general help shows; book's note is loud because it writes. */
+const COMMANDS = {
+  draft: { usage: "node . draft <range> [--grid|--list]", flags: ["--grid", "--list"], summary: "draft worklogs", note: "(read-only)", loud: false },
+  book: { usage: "node . book [--dry-run] [<file>]", flags: ["--dry-run"], summary: "book draft lines", note: "(WRITES to Tempo)", loud: true },
+  demo: { usage: "node . demo [--grid|--list]", flags: ["--grid", "--list"], summary: "made-up week", note: "(no API calls)", loud: false },
+  help: { usage: "node . help [<command>]", flags: [], summary: "this help, or help for a command", note: "", loud: false },
+} satisfies Record<string, { usage: string; flags: string[]; summary: string; note: string; loud: boolean }>;
+type CommandName = keyof typeof COMMANDS;
+const COMMAND_NAMES = Object.keys(COMMANDS) as CommandName[];
 const RANGE_HINT = 'Run "node . draft --help" for all range forms.';
 const DRAFT_VARIABLES = ["TEMPO_API_TOKEN", "ATLASSIAN_SITE", "ATLASSIAN_EMAIL", "ATLASSIAN_API_TOKEN", "GITHUB_TOKEN", "GITHUB_OWNERS"];
 const BOOK_VARIABLES = DRAFT_VARIABLES.slice(0, 4);
@@ -1418,7 +1424,7 @@ async function draft(input: string, view: ViewName | undefined, now: Date): Prom
   const today = localDate(now);
   const [from, requestedTo] = parseRange(input, today);
   const to = requestedTo > today ? today : requestedTo;
-  if (from > to) throw new UsageError(`${from} is in the future (today is ${weekday(today)} ${today})`, USAGE_DRAFT, RANGE_HINT);
+  if (from > to) throw new UsageError(`${from} is in the future (today is ${weekday(today)} ${today})`, COMMANDS.draft.usage, RANGE_HINT);
 
   const warnings: string[] = [];
   // Steps are the requests until a source is finished; GitHub counts its repositories separately.
@@ -2707,7 +2713,7 @@ function helpText(command: string | undefined, tty: Tty | undefined, now: Date, 
   if (command === "draft") {
     return [
       "",
-      heading(USAGE_DRAFT),
+      heading(COMMANDS.draft.usage),
       "",
       "Drafts worklogs for <range> from GitHub commits and pull request reviews,",
       "calendar meetings and Jira activity, around what is booked already.",
@@ -2732,7 +2738,7 @@ function helpText(command: string | undefined, tty: Tty | undefined, now: Date, 
   if (command === "book") {
     return [
       "",
-      heading(USAGE_BOOK),
+      heading(COMMANDS.book.usage),
       "",
       `Books draft lines in Tempo. ${paint("WRITES worklogs", COLOR.attention, { bold: true })}: use only approved lines.`,
       "Reads <file>, or stdin without it. Lines starting with # are skipped.",
@@ -2762,7 +2768,7 @@ function helpText(command: string | undefined, tty: Tty | undefined, now: Date, 
   if (command === "demo") {
     return [
       "",
-      heading(USAGE_DEMO),
+      heading(COMMANDS.demo.usage),
       "",
       "Shows a made-up week (Monday to Thursday of this week) in the draft views,",
       `with every kind of line. ${dim("Offline: no API calls, no .env needed.")}`,
@@ -2783,6 +2789,11 @@ function helpText(command: string | undefined, tty: Tty | undefined, now: Date, 
     const status = set ? paint("set    ", COLOR.done) : required ? paint("missing", COLOR.attention, { bold: true }) : paint("missing", COLOR.warning);
     return `  ${variable.padEnd(20)} ${status}  ${dim(set ? shownValue(variable) : note)}`.trimEnd();
   });
+  const usageWidth = Math.max(...Object.values(COMMANDS).map((each) => each.usage.length));
+  const usages = Object.entries(COMMANDS).map(([command, { usage, summary, note, loud }]) => {
+    const marked = !note ? "" : ` ${loud ? paint(note, COLOR.attention, { bold: true }) : dim(note)}`;
+    return `  node . ${name(command)}${usage.slice(`node . ${command}`.length).padEnd(usageWidth - `node . ${command}`.length)}  ${summary}${marked}`;
+  });
   return [
     "",
     heading("tempo_timesheet_drafter"),
@@ -2791,10 +2802,7 @@ function helpText(command: string | undefined, tty: Tty | undefined, now: Date, 
     "reviews, calendar and Jira activity, and books the lines you approve.",
     "",
     heading("Usage:"),
-    `  node . ${name("draft")} <range> [--grid|--list]  draft worklogs ${dim("(read-only)")}`,
-    `  node . ${name("book")} [--dry-run] [<file>]      book draft lines ${paint("(WRITES to Tempo)", COLOR.attention, { bold: true })}`,
-    `  node . ${name("demo")} [--grid|--list]           made-up week ${dim("(no API calls)")}`,
-    `  node . ${name("help")} [<command>]               this help, or help for a command`,
+    ...usages,
     "",
     heading("Workflow:"),
     `  node . draft yesterday > draft.txt    ${dim("1. draft, then review draft.txt")}`,
@@ -2830,8 +2838,13 @@ function helpText(command: string | undefined, tty: Tty | undefined, now: Date, 
 
 // --- command line ---------------------------------------------------------
 
-const COMMANDS = ["draft", "book", "demo", "help"];
-const FLAGS: Record<string, string[]> = { draft: ["--grid", "--list"], demo: ["--grid", "--list"], book: ["--dry-run"] };
+function isCommand(name: string | undefined): name is CommandName {
+  return name !== undefined && Object.hasOwn(COMMANDS, name);
+}
+
+function detailsHint(command: CommandName): string {
+  return `Run "node . ${command} --help" for details.`;
+}
 
 /** The closest option within an edit distance of 2 (or by prefix), for "did you mean"; never run, only suggested. */
 export function closest(word: string, options: string[]): string | undefined {
@@ -2851,9 +2864,9 @@ export function closest(word: string, options: string[]): string | undefined {
   return best && best.score <= 2 ? best.option : undefined;
 }
 
-function parseCommand(command: string, args: string[]): { positionals: string[]; flags: Set<string>; usage: string } {
-  const usage = { draft: USAGE_DRAFT, book: USAGE_BOOK, demo: USAGE_DEMO }[command] ?? "";
-  const allowed = FLAGS[command] ?? [];
+function parseCommand(command: CommandName, args: string[]): { positionals: string[]; flags: Set<string>; usage: string } {
+  const { usage } = COMMANDS[command];
+  const allowed: string[] = COMMANDS[command].flags;
   const flags = new Set<string>();
   const positionals: string[] = [];
   for (const arg of args) {
@@ -2864,11 +2877,11 @@ function parseCommand(command: string, args: string[]): { positionals: string[];
     if (!allowed.includes(arg)) {
       const guess = closest(arg, allowed);
       const safety = command === "book" ? " Nothing was booked." : "";
-      throw new UsageError(`unknown option "${arg}"${guess ? `; did you mean "${guess}"?` : ""}${safety}`, usage, `Run "node . ${command} --help" for details.`);
+      throw new UsageError(`unknown option "${arg}"${guess ? `; did you mean "${guess}"?` : ""}${safety}`, usage, detailsHint(command));
     }
     flags.add(arg);
   }
-  if (flags.has("--grid") && flags.has("--list")) throw new UsageError("--grid and --list exclude each other", usage, `Run "node . ${command} --help" for details.`);
+  if (flags.has("--grid") && flags.has("--list")) throw new UsageError("--grid and --list exclude each other", usage, detailsHint(command));
   return { positionals, flags, usage };
 }
 
@@ -2879,19 +2892,19 @@ async function main(): Promise<void> {
   const [command = "", ...args] = process.argv.slice(2);
   const help = command === "help" || command === "-h" || command === "--help" || args.includes("-h") || args.includes("--help");
   if (!command || help) {
-    const topic = command === "help" ? args[0] : COMMANDS.includes(command) ? command : undefined;
-    if (topic && !COMMANDS.includes(topic)) {
-      const guess = closest(topic, COMMANDS);
-      throw new UsageError(`no help for "${topic}"${guess ? `; did you mean "${guess}"?` : ""}`, "node . help [<command>]", `Commands: ${COMMANDS.join(", ")}.`);
+    const topic = command === "help" ? args[0] : isCommand(command) ? command : undefined;
+    if (topic && !isCommand(topic)) {
+      const guess = closest(topic, COMMAND_NAMES);
+      throw new UsageError(`no help for "${topic}"${guess ? `; did you mean "${guess}"?` : ""}`, COMMANDS.help.usage, `Commands: ${COMMAND_NAMES.join(", ")}.`);
     }
     console.log(helpText(topic === "help" ? undefined : topic, terminal(), now, process.env));
     return;
   }
-  if (!COMMANDS.includes(command)) {
-    const guess = closest(command, COMMANDS);
+  if (!isCommand(command)) {
+    const guess = closest(command, COMMAND_NAMES);
     throw new UsageError(
       `unknown command "${command}"${guess ? `; did you mean "${guess}"?` : ""}`,
-      guess ? ({ draft: USAGE_DRAFT, book: USAGE_BOOK, demo: USAGE_DEMO }[guess] ?? "node . help") : `commands: ${COMMANDS.join(", ")}`,
+      !guess ? `commands: ${COMMAND_NAMES.join(", ")}` : guess === "help" ? "node . help" : COMMANDS[guess as CommandName].usage,
       'Run "node . --help" for all commands.',
     );
   }
@@ -2899,7 +2912,7 @@ async function main(): Promise<void> {
   const { positionals, flags, usage } = parseCommand(command, args);
   const view = flags.has("--grid") ? "grid" : flags.has("--list") ? "list" : undefined;
   if (command === "demo") {
-    if (positionals.length) throw new UsageError(`demo takes only --grid or --list, got "${positionals.join(" ")}"`, usage, 'Run "node . demo --help" for details.');
+    if (positionals.length) throw new UsageError(`demo takes only --grid or --list, got "${positionals.join(" ")}"`, usage, detailsHint("demo"));
     demo(view, now);
     return;
   }
@@ -2922,7 +2935,7 @@ async function main(): Promise<void> {
   const file = positionals[0];
   // Reading stdin from an interactive terminal would just wait.
   if (!file && process.stdin.isTTY) {
-    throw new UsageError("book needs draft lines from <file> or stdin; nothing was booked", usage, 'example: node . book --dry-run draft.txt\nRun "node . book --help" for details.');
+    throw new UsageError("book needs draft lines from <file> or stdin; nothing was booked", usage, `example: node . book --dry-run draft.txt\n${detailsHint("book")}`);
   }
   if (file && !existsSync(file)) throw new Error(`cannot read "${file}": no such file; nothing was booked`);
   if (!(await book(readText(file), flags.has("--dry-run"), now))) process.exitCode = 1;
