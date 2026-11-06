@@ -928,7 +928,7 @@ async function pullRequests(from: string, to: string, viewerRequest: Promise<Vie
       warnings.push(`skipped reviews of ${owner}: ${errorMessage(error)}`);
     }
   }
-  const comments: PullRequestComment[] = [];
+  const conversation: PullRequestComment[] = [];
   try {
     for (let after: string | null = null; ; ) {
       type Connection = { pageInfo: PageInfo; nodes: (PullRequestComment | null)[] };
@@ -936,7 +936,7 @@ async function pullRequests(from: string, to: string, viewerRequest: Promise<Vie
       if (!data) break;
       const page: Connection = data.viewer.issueComments;
       const nodes = page.nodes.filter((node) => node !== null);
-      comments.push(...nodes);
+      conversation.push(...nodes);
       // Newest update first: a comment created in the range was updated in it or later.
       if (!page.pageInfo.hasNextPage || nodes.some((node) => node.updatedAt < since)) break;
       after = page.pageInfo.endCursor;
@@ -954,7 +954,7 @@ async function pullRequests(from: string, to: string, viewerRequest: Promise<Vie
       warnings.push(`GitHub: only the first ${COMMENTS_PER_REVIEW} comments per review of ${pullRequest.repository.nameWithOwner}#${pullRequest.number} read`);
     }
   }
-  return pullRequestEvents([...reviewed.values()], comments, login, owners, from, to);
+  return pullRequestEvents([...reviewed.values()], conversation, login, owners, from, to);
 }
 
 /**
@@ -1765,9 +1765,9 @@ function weekdayName(date: string): string {
   return `${name[0].toUpperCase()}${name.slice(1)}`;
 }
 
-/** "4h15m / 7h ✓" with the holiday in front; `check` adds the ✓ once the required hours are reached. */
-function dayAmount(done: number, required: number, holiday: string | undefined, between: string, check: boolean): string {
-  const hours = required ? `${duration(done)}${between}${duration(required)}${check && done >= required ? " ✓" : ""}` : done ? duration(done) : "";
+/** "4h15m / 7h ✓" with the holiday in front; `withCheck` adds the ✓ once the required hours are reached. */
+function dayAmount(done: number, required: number, holiday: string | undefined, between: string, withCheck: boolean): string {
+  const hours = required ? `${duration(done)}${between}${duration(required)}${withCheck && done >= required ? " ✓" : ""}` : done ? duration(done) : "";
   return holiday ? [holiday, hours].filter(Boolean).join(" · ") : hours;
 }
 
@@ -2062,7 +2062,7 @@ function canvas(columns: number): Canvas {
   return { rows, at, put, text };
 }
 
-/** Where the grid's parts go: the first row of blocks, the hours shown, each day's first column and the column width. */
+/** Where the grid's parts go (first block row, hours shown, each day's first column, column width) and what marks today and now. */
 interface Frame {
   top: number;
   hours: [number, number];
@@ -2081,7 +2081,7 @@ function gridDays(days: DayPlan[]): DayPlan[] {
 
 /**
  * The grid's cells for `days` at `width` columns, and the entries it cannot show (outside the hours or too many
- * overlaps); undefined when the columns would be narrower than 8 cells.
+ * overlaps); undefined when no day is shown or the columns would be narrower than 8 cells.
  */
 export function layoutGrid(days: DayPlan[], now: Date, width: number, depth: number, url: (key: string) => string | undefined): { rows: Cell[][]; hidden: Item[] } | undefined {
   const shown = gridDays(days);
@@ -2221,15 +2221,15 @@ function drawNow({ at, put, text }: Canvas, shown: DayPlan[], { top, hours, xs, 
  * source's color with a darker stripe, booked entries muted with "✓", the one running now orange. The rule under each
  * day fills toward its required hours. Questions and missing hours follow below.
  */
-function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: string[], subtitle: string, projects: Set<string>): void {
-  const { tty, now, site } = screen;
+function printGrid(display: Screen, range: string, days: DayPlan[], warnings: string[], subtitle: string, projects: Set<string>): void {
+  const { tty, now, site } = display;
   const paint = painter(tty);
   const url = dayLinks(days, projects, site);
   const withKeys = keyLinker(paint, url);
   const width = tty ? tty.width - 1 : 120;
   const layout = layoutGrid(days, now, width, tty?.depth ?? 1, url);
   if (!layout) {
-    printDraft(screen, range, days, warnings, subtitle, projects);
+    printDraft(display, range, days, warnings, subtitle, projects);
     return;
   }
   const today = localDate(now);
@@ -2280,9 +2280,9 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
  * The grid for a person at a terminal, the list (the draft lines book reads) otherwise or on request. A redirect gets
  * the list even with FORCE_COLOR or --grid, so "draft > draft.txt" always gives a file book can read.
  */
-function show(screen: Screen, range: string, days: DayPlan[], warnings: string[], view: ViewName | undefined, subtitle = "", projects = new Set<string>()): void {
-  if (view !== "list" && screen.tty?.wraps) printGrid(screen, range, days, warnings, subtitle, projects);
-  else printDraft(screen, range, days, warnings, subtitle, projects);
+function show(display: Screen, range: string, days: DayPlan[], warnings: string[], view: ViewName | undefined, subtitle = "", projects = new Set<string>()): void {
+  if (view !== "list" && display.tty?.wraps) printGrid(display, range, days, warnings, subtitle, projects);
+  else printDraft(display, range, days, warnings, subtitle, projects);
 }
 
 // --- progress -------------------------------------------------------------
@@ -2355,9 +2355,9 @@ function progress(steps: Record<string, number>) {
   const find = (name: string) => sources.find((source) => source.name === name)!;
   const started = Date.now();
   const depth = active ? process.stderr.getColorDepth() : 1;
-  const markColor = (mark: string) => (mark === "✓" ? COLOR.done : mark === "✗" ? COLOR.attention : COLOR.jira);
+  const tint = (mark: string) => (mark === "✓" ? COLOR.done : mark === "✗" ? COLOR.attention : COLOR.jira);
   const paint = (text: string) =>
-    depth > 1 ? text.replace(new RegExp(`[✓✗${SPINNER}]`, "g"), (mark) => `\x1b[${colorCode(markColor(mark), depth)}m${mark}\x1b[0m`) : text;
+    depth > 1 ? text.replace(new RegExp(`[✓✗${SPINNER}]`, "g"), (mark) => `\x1b[${colorCode(tint(mark), depth)}m${mark}\x1b[0m`) : text;
   let shown = "";
   // A blank line sets the line apart from the command above; the first write opens it.
   const open = () => (shown ? "\r\x1b[2K" : "\n");
@@ -2417,18 +2417,18 @@ async function draft(input: string, view: ViewName | undefined, now: Date): Prom
     // GitHub and the calendar need nothing from Jira, so they start with the first requests.
     const user = viewer();
     const counted = (total: number, skipped: number) => bar.count("GitHub", total, "repos", skipped);
-    const history = bar.track("GitHub", commits(from, to, user, sourceWarnings.commits, counted), (found) => `${found.length} commits`);
+    const authored = bar.track("GitHub", commits(from, to, user, sourceWarnings.commits, counted), (found) => `${found.length} commits`);
     const pulls = bar.track("GitHub", pullRequests(from, to, user, sourceWarnings.pullRequests), (found) => {
       const reviews = found.filter((event) => event.kind === "pr-review").length;
       return `${reviews} reviews, ${found.length - reviews} comments`;
     });
     const events = bar.track("Calendar", calendar(from, to, sourceWarnings.calendar), (found) => `${found.length} meetings`);
     // Awaited later; without a handler, a failure during the first requests would make them unhandled rejections.
-    for (const early of [user, history, pulls, events]) early.catch(() => {});
+    for (const early of [user, authored, pulls, events]) early.catch(() => {});
     const [account, projects, days] = await Promise.all([bar.track("Jira", accountId()), bar.track("Jira", projectKeys()), bar.track("Tempo", schedule(from, to))]);
     const [existing, code, reviews, meetings, tickets, views] = await Promise.all([
       bar.track("Tempo", booked(account, from, to), (found) => `${found.length} worklogs`),
-      history,
+      authored,
       pulls,
       events,
       bar.track("Jira", jiraActivity(account, from, to), (found) => `${found.length} changes`),
