@@ -225,6 +225,9 @@ function mondayOf(date: string): string {
   return addDays(date, -((dayOfWeek(date) + 6) % 7));
 }
 
+/** A range that cannot be read; the command line adds its usage line. */
+export class InvalidRange extends Error {}
+
 export function parseRange(input: string, today: string): [string, string] {
   const text = input.toLowerCase().replace(/\s+/g, "");
   if (text === "today" || text === "day" || text === "heute") return [today, today];
@@ -236,7 +239,7 @@ export function parseRange(input: string, today: string): [string, string] {
   }
   const week = /^(?:(\d{4})-)?k?w(\d{1,2})$/.exec(text);
   if (week) {
-    if (Number(week[2]) < 1 || Number(week[2]) > 53) throw new UsageError(`kw${week[2]} does not exist; weeks run from kw1 to kw53`, USAGE_DRAFT, RANGE_HINT);
+    if (Number(week[2]) < 1 || Number(week[2]) > 53) throw new InvalidRange(`kw${week[2]} does not exist; weeks run from kw1 to kw53`);
     const year = week[1] ?? today.slice(0, 4);
     const monday = addDays(mondayOf(`${year}-01-04`), (Number(week[2]) - 1) * 7);
     return [monday, addDays(monday, 6)];
@@ -247,12 +250,12 @@ export function parseRange(input: string, today: string): [string, string] {
     for (const date of [from, to]) {
       if (isDate(date)) continue;
       const swapped = `${date.slice(0, 4)}-${date.slice(8)}-${date.slice(5, 7)}`;
-      throw new UsageError(`"${date}" is not a date${isDate(swapped) ? `; did you mean ${swapped}?` : " (YYYY-MM-DD)"}`, USAGE_DRAFT, RANGE_HINT);
+      throw new InvalidRange(`"${date}" is not a date${isDate(swapped) ? `; did you mean ${swapped}?` : " (YYYY-MM-DD)"}`);
     }
-    if (from > to) throw new UsageError(`range "${input}" ends before it starts; did you mean ${to}..${from}?`, USAGE_DRAFT, RANGE_HINT);
+    if (from > to) throw new InvalidRange(`range "${input}" ends before it starts; did you mean ${to}..${from}?`);
     return [from, to];
   }
-  throw new UsageError(`unknown range "${input}"`, USAGE_DRAFT, RANGE_HINT);
+  throw new InvalidRange(`unknown range "${input}"`);
 }
 
 /** ISO week number, as kw45 in parseRange counts it. */
@@ -1331,8 +1334,8 @@ export function planDay(
 
 // --- draft ----------------------------------------------------------------
 
-async function draft(input: string, view?: "grid" | "list"): Promise<void> {
-  const today = localDate(new Date());
+async function draft(input: string, view: ViewName | undefined, now: Date): Promise<void> {
+  const today = localDate(now);
   const [from, requestedTo] = parseRange(input, today);
   const to = requestedTo > today ? today : requestedTo;
   if (from > to) throw new UsageError(`${from} is in the future (today is ${weekday(today)} ${today})`, USAGE_DRAFT, RANGE_HINT);
@@ -1382,10 +1385,12 @@ async function draft(input: string, view?: "grid" | "list"): Promise<void> {
       meetings.filter((meeting) => meeting.date === day.date),
       projects,
       views.filter((view) => view.date === day.date),
+      now,
     );
     return { day, dayExisting, ...plan };
   });
   show(
+    screen(now),
     `${from}..${to}`,
     planned.map(({ day, dayExisting, entries, notes }) => ({
       date: day.date,
@@ -1536,21 +1541,47 @@ function agent(): boolean {
   return Boolean(env.AI_AGENT || env.OPENCODE || env.CLAUDECODE || env.CODEX_THREAD_ID || env.CODEX_CI);
 }
 
-let linksAllowed = true;
+/** A person reads `stream`: a terminal, not an agent's PTY, not TERM=dumb. */
+function person(stream: { isTTY?: boolean }): boolean {
+  return Boolean(stream.isTTY) && !agent() && process.env.TERM !== "dumb";
+}
 
 /** Issue keys link to Jira wherever colors are shown; no terminal list, since Windows Terminal often sets no WT_SESSION. */
 export function hyperlinks(env: NodeJS.ProcessEnv): boolean {
   return Boolean(env.ATLASSIAN_SITE) && env.FORCE_HYPERLINK !== "0" && env.TERM_PROGRAM !== "Apple_Terminal";
 }
 
-function terminal(): { depth: number; width: number; links: boolean } | undefined {
+/** Colors for stdout; `wraps` only at a real terminal, since FORCE_COLOR in a pipe colors lines that must stay whole. */
+interface Tty {
+  depth: number;
+  width: number;
+  links: boolean;
+  wraps: boolean;
+}
+
+function terminal(links = true): Tty | undefined {
   const env = process.env;
   // FORCE_COLOR keeps the colors in a pipe (less -R); getColorDepth handles NO_COLOR and FORCE_COLOR levels.
   const forced = env.FORCE_COLOR !== undefined && env.FORCE_COLOR !== "0";
-  if ((!process.stdout.isTTY && !forced) || agent() || env.TERM === "dumb") return undefined;
-  const links = linksAllowed && hyperlinks(env);
+  if (!person({ isTTY: process.stdout.isTTY || forced })) return undefined;
   const depth = process.stdout.isTTY ? process.stdout.getColorDepth() : ({ "2": 8, "3": 24 } as Record<string, number>)[env.FORCE_COLOR!] ?? 4;
-  return { depth, width: process.stdout.columns || 100, links };
+  return { depth, width: process.stdout.columns || 100, links: links && hyperlinks(env), wraps: Boolean(process.stdout.isTTY) };
+}
+
+/** One right edge for list lines and their wrapping; past about 120 columns lines get hard to follow. */
+function listWidth(tty: Tty | undefined): number {
+  return tty?.wraps ? Math.min(120, Math.max(40, tty.width - 1)) : Infinity;
+}
+
+/** Where and when output appears: the terminal (undefined for plain text), the clock, and the Jira site keys link to. */
+interface Screen {
+  tty: Tty | undefined;
+  now: Date;
+  site: string | undefined;
+}
+
+function screen(now: Date, links = true): Screen {
+  return { tty: terminal(links), now, site: process.env.ATLASSIAN_SITE };
 }
 
 /** Foreground (38) or background (48) in the terminal's color depth. */
@@ -1595,6 +1626,8 @@ function painter(tty: { depth: number; links: boolean } | undefined) {
 
 // --- output ---------------------------------------------------------------
 
+type ViewName = "grid" | "list";
+
 interface DayPlan {
   date: string;
   required: number;
@@ -1626,9 +1659,9 @@ export function keyPieces(text: string, url: (key: string) => string | undefined
 }
 
 /** Keys of the Jira projects and of every line shown link; "?" and made-up words such as UTF-8 do not. */
-function dayLinks(days: DayPlan[], projects: Set<string>): (key: string) => string | undefined {
+function dayLinks(days: DayPlan[], projects: Set<string>, site: string | undefined): (key: string) => string | undefined {
   const issues = days.flatMap((day) => [...day.booked, ...day.entries]).filter((entry) => entry.issue !== "?");
-  return issueUrl(process.env.ATLASSIAN_SITE, new Set([...projects, ...issues.map((entry) => entry.issue.slice(0, entry.issue.lastIndexOf("-")))]));
+  return issueUrl(site, new Set([...projects, ...issues.map((entry) => entry.issue.slice(0, entry.issue.lastIndexOf("-")))]));
 }
 
 const NOTE_ORDER = ["?", "!", "·"];
@@ -1659,7 +1692,7 @@ export function filledCells(done: number, required: number, cells: number): numb
 const HEADER_LEAD = "# ── ";
 
 /** `# ── Mon 2026-11-02 ━━━━━━──── 4h15m / 7h ──`, shared by the list and book's report. */
-function dayHeader(date: string, done: number, required: number, holiday: string | undefined, width: number, tty: ReturnType<typeof terminal>): string {
+function dayHeader(date: string, done: number, required: number, holiday: string | undefined, width: number, tty: Tty | undefined, today: string): string {
   const paint = painter(tty);
   const name = `${weekday(date)[0].toUpperCase()}${weekday(date).slice(1)} ${date}`;
   const hours = required ? `${duration(done)} / ${duration(required)}${tty && done >= required ? " ✓" : ""}` : done ? duration(done) : "";
@@ -1669,7 +1702,7 @@ function dayHeader(date: string, done: number, required: number, holiday: string
   // Plain output keeps a plain rule, so a file for book stays as it was.
   const filled = tty ? filledCells(done, required, rule) : 0;
   return (
-    `${paint(HEADER_LEAD, COLOR.faint)}${paint(name, date === localDate(new Date()) ? COLOR.question : undefined, { bold: true })} ` +
+    `${paint(HEADER_LEAD, COLOR.faint)}${paint(name, date === today ? COLOR.question : undefined, { bold: true })} ` +
     `${paint("━".repeat(filled), done >= required ? COLOR.done : COLOR.dim)}${paint("─".repeat(rule - filled), COLOR.faint)} ` +
     `${paint(amount, holiday ? COLOR.dim : done >= required ? COLOR.done : undefined, { bold: true })}${paint(" ──", COLOR.faint)}`
   );
@@ -1679,9 +1712,9 @@ function dayHeader(date: string, done: number, required: number, holiday: string
  * The grid for a person at a terminal, the list (the draft lines book reads) otherwise or on request. A redirect gets
  * the list even with FORCE_COLOR or --grid, so "draft > draft.txt" always gives a file book can read.
  */
-function show(range: string, days: DayPlan[], warnings: string[], view: "grid" | "list" | undefined, subtitle = "", projects = new Set<string>()): void {
-  if (view !== "list" && process.stdout.isTTY && terminal()) printGrid(range, days, warnings, subtitle, projects);
-  else printDraft(range, days, warnings, subtitle, projects);
+function show(screen: Screen, range: string, days: DayPlan[], warnings: string[], view: ViewName | undefined, subtitle = "", projects = new Set<string>()): void {
+  if (view !== "list" && screen.tty?.wraps) printGrid(screen, range, days, warnings, subtitle, projects);
+  else printDraft(screen, range, days, warnings, subtitle, projects);
 }
 
 // --- list -----------------------------------------------------------------
@@ -1691,14 +1724,12 @@ function show(range: string, days: DayPlan[], warnings: string[], view: "grid" |
  * color, and long ones wrap: a work line continues indented without "#", so a copied continuation fails loudly in
  * book instead of booking a shortened description; a "#" line continues as a comment.
  */
-function printDraft(range: string, days: DayPlan[], warnings: string[], subtitle = "", projects = new Set<string>()): void {
-  const tty = terminal();
+function printDraft({ tty, now, site }: Screen, range: string, days: DayPlan[], warnings: string[], subtitle: string, projects: Set<string>): void {
   const paint = painter(tty);
-  const url = dayLinks(days, projects);
+  const url = dayLinks(days, projects, site);
   const withKeys = (text: string, color?: Rgb) => keyPieces(text, url).map((piece) => paint(piece.text, color, { link: piece.link })).join("");
-  // One right edge for headers and wrapped lines; past about 120 columns lines get hard to follow. Only a real terminal
-  // wraps: with FORCE_COLOR in a pipe, wrapped lines would no longer be draft lines.
-  const width = tty && process.stdout.isTTY ? Math.min(120, Math.max(40, tty.width - 1)) : Infinity;
+  const width = listWidth(tty);
+  const today = localDate(now);
   const all = days.flatMap((day) => [...day.booked, ...day.entries]);
   const issueWidth = Math.max(3, ...all.map((entry) => entry.issue.length));
   const durationWidth = Math.max(3, ...all.map((entry) => duration(entry.minutes).length));
@@ -1716,7 +1747,7 @@ function printDraft(range: string, days: DayPlan[], warnings: string[], subtitle
       out.push(head + withKeys(part, COLOR.dim));
     });
   };
-  const header = (date: string, done: number, required: number, holiday?: string) => out.push(dayHeader(date, done, required, holiday, width, tty));
+  const header = (date: string, done: number, required: number, holiday?: string) => out.push(dayHeader(date, done, required, holiday, width, tty, today));
   const entryLine = (entry: Entry, booked: boolean) => {
     const prefix = booked ? bookedPrefix : indent;
     const head = `${entry.date} ${clock(entry.start)} ${duration(entry.minutes).padStart(durationWidth)}  `;
@@ -1894,12 +1925,12 @@ export function lanes(entries: { entry: Entry; booked: boolean }[], maxLanes: nu
  * source's color with a darker stripe, booked entries muted with "✓", the one running now orange. The rule under each
  * day fills toward its required hours. Questions and missing hours follow below.
  */
-function printGrid(range: string, days: DayPlan[], warnings: string[], subtitle: string, projects: Set<string>): void {
-  const tty = terminal();
+function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: string[], subtitle: string, projects: Set<string>): void {
+  const { tty, now, site } = screen;
   const depth = tty?.depth ?? 1;
   const color = depth > 1;
   const paint = painter(tty);
-  const url = dayLinks(days, projects);
+  const url = dayLinks(days, projects, site);
   const withKeys = (text: string, color?: Rgb) => keyPieces(text, url).map((piece) => paint(piece.text, color, { link: piece.link })).join("");
   const shown = days.filter((day) => day.required > 0 || day.holiday || day.booked.length || day.entries.length);
   const all = shown.flatMap((day) => [...day.booked, ...day.entries]);
@@ -1910,7 +1941,7 @@ function printGrid(range: string, days: DayPlan[], warnings: string[], subtitle:
   const gutter = 6;
   const columnWidth = Math.floor((width - gutter) / Math.max(1, shown.length)) - 1;
   if (!shown.length || columnWidth < 8) {
-    printDraft(range, days, warnings, subtitle, projects);
+    printDraft(screen, range, days, warnings, subtitle, projects);
     return;
   }
 
@@ -1932,7 +1963,7 @@ function printGrid(range: string, days: DayPlan[], warnings: string[], subtitle:
   };
 
   const top = 2;
-  const today = localDate(new Date());
+  const today = localDate(now);
   const xs = shown.map((_, index) => gutter + index * (columnWidth + 1) + 1);
   const rowCount = (hours[1] - hours[0]) * ROWS_PER_HOUR;
   shown.forEach((day, index) => {
@@ -1959,7 +1990,6 @@ function printGrid(range: string, days: DayPlan[], warnings: string[], subtitle:
     }
   }
 
-  const now = new Date();
   const minute = now.getHours() * 60 + now.getMinutes();
   const hiddenItems: Item[] = [];
   const blocks: { x: number; y: number; w: number }[] = [];
@@ -2131,7 +2161,7 @@ export function summaryLine(sources: Source[], seconds: number, columns = Infini
  * terminal; agents, pipes and logs get nothing, and "draft > draft.txt" still shows it since stderr stays.
  */
 function progress(steps: Record<string, number>) {
-  const active = Boolean(process.stderr.isTTY) && !agent() && process.env.TERM !== "dumb";
+  const active = person(process.stderr);
   const sources: Source[] = Object.entries(steps).map(([name, count]) => ({ name, steps: count, done: 0, failed: false, details: [] }));
   const find = (name: string) => sources.find((source) => source.name === name)!;
   const started = Date.now();
@@ -2184,10 +2214,8 @@ function progress(steps: Record<string, number>) {
 // --- demo -----------------------------------------------------------------
 
 /** A made-up week through the same output, without any API call: shows every kind of line. */
-function demo(view?: "grid" | "list"): void {
-  // Made-up keys must not link into the real Jira site.
-  linksAllowed = false;
-  const monday = mondayOf(localDate(new Date()));
+function demo(view: ViewName | undefined, now: Date): void {
+  const monday = mondayOf(localDate(now));
   const day = (offset: number) => addDays(monday, offset);
   const entry = (date: string, time: string, minutes: number, issue: string, description: string, extra: Partial<Entry> = {}): Entry => ({
     date,
@@ -2202,6 +2230,8 @@ function demo(view?: "grid" | "list"): void {
   const wed = day(2);
   const thu = day(3);
   show(
+    // Made-up keys must not link into the real Jira site.
+    screen(now, false),
     `${mon}..${thu}`,
     [
       {
@@ -2321,9 +2351,10 @@ function span(entry: Entry): string {
  */
 async function check(
   text: string,
+  now: Date,
 ): Promise<{ account: string; planned: Planned[]; existing: Booked[]; warnings: string[]; remaining: Map<number, number> }> {
   const problems: string[] = [];
-  const entries = parseLines(text, new Date(), problems);
+  const entries = parseLines(text, now, problems);
   const abort = () => new Error(`${problems.length} problem(s), nothing was booked:\n${problems.join("\n")}\nFix these lines and run book again.`);
   if (problems.length) throw abort();
   if (!entries.length) return { account: "", planned: [], existing: [], warnings: [], remaining: new Map() };
@@ -2365,15 +2396,15 @@ async function check(
  * Books the checked lines and reports them in the list's layout: a header per day with its total against the
  * required hours, then one line per worklog with its outcome in front. Lines print as they are posted.
  */
-async function book(text: string, dryRun: boolean): Promise<boolean> {
-  const { account, planned, existing, warnings, remaining } = await check(text);
+async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> {
+  const { account, planned, existing, warnings, remaining } = await check(text, now);
   if (!planned.length) {
     console.log("Nothing to book.");
     return true;
   }
-  const tty = terminal();
+  const { tty, site } = screen(now);
   const paint = painter(tty);
-  const width = tty && process.stdout.isTTY ? Math.min(120, Math.max(40, tty.width - 1)) : Infinity;
+  const width = listWidth(tty);
   const say = (line = "") => console.log(line);
   const gap = () => say(paint("#", COLOR.faint));
   const comment = (text: string, mark = "", markColor?: Rgb) => {
@@ -2397,7 +2428,7 @@ async function book(text: string, dryRun: boolean): Promise<boolean> {
   const statusWidth = dryRun ? "would book".length : "booked 00000000".length;
   const sum = (entries: Entry[]) => entries.reduce((total, entry) => total + entry.minutes, 0);
   // check found every key in Jira.
-  const url = issueUrl(process.env.ATLASSIAN_SITE, new Set(planned.map((entry) => entry.issue.slice(0, entry.issue.lastIndexOf("-")))));
+  const url = issueUrl(site, new Set(planned.map((entry) => entry.issue.slice(0, entry.issue.lastIndexOf("-")))));
 
   const line = (entry: Planned, status: string, statusColor: Rgb, note = "") => {
     const muted = statusColor === COLOR.dim;
@@ -2427,7 +2458,7 @@ async function book(text: string, dryRun: boolean): Promise<boolean> {
   for (const date of dates) {
     const lines = planned.filter((entry) => entry.date === date).sort((a, b) => a.start - b.start || a.line - b.line);
     gap();
-    say(dayHeader(date, sum(existing.filter((entry) => entry.date === date)) + sum(lines.filter((entry) => !entry.duplicate)), required.get(date) ?? 0, undefined, width, tty));
+    say(dayHeader(date, sum(existing.filter((entry) => entry.date === date)) + sum(lines.filter((entry) => !entry.duplicate)), required.get(date) ?? 0, undefined, width, tty, localDate(now)));
     gap();
     const failures: string[] = [];
     for (const entry of lines) {
@@ -2473,13 +2504,12 @@ async function book(text: string, dryRun: boolean): Promise<boolean> {
 
 // --- help -----------------------------------------------------------------
 
-function helpText(command?: string): string {
-  const tty = terminal();
+function helpText(command: string | undefined, tty: Tty | undefined, now: Date, env: NodeJS.ProcessEnv): string {
   const paint = painter(tty);
   const heading = (text: string) => paint(text, undefined, { bold: true });
   const name = (text: string) => paint(text, COLOR.code, { bold: true });
   const dim = (text: string) => paint(text, COLOR.dim);
-  const today = localDate(new Date());
+  const today = localDate(now);
   const [monday, sunday] = parseRange("week", today);
   const day = `${weekday(today)[0].toUpperCase()}${weekday(today).slice(1)}`;
   const todayLine = `Today is ${paint(`${day} ${today}`, COLOR.question, { bold: true })}: week = kw${isoWeek(today)} = ${monday}..${sunday}.`;
@@ -2563,9 +2593,9 @@ function helpText(command?: string): string {
     ...DRAFT_VARIABLES.map((variable): [string, boolean, string] => [variable, true, ""]),
     ["CALENDAR_ICS_URL", false, "optional; without it, drafts have no meetings"],
   ];
-  const shownValue = (variable: string) => (["ATLASSIAN_SITE", "GITHUB_OWNERS"].includes(variable) ? (process.env[variable] ?? "") : "");
+  const shownValue = (variable: string) => (["ATLASSIAN_SITE", "GITHUB_OWNERS"].includes(variable) ? (env[variable] ?? "") : "");
   const setup = variables.map(([variable, required, note]) => {
-    const set = Boolean(process.env[variable]);
+    const set = Boolean(env[variable]);
     const status = set ? paint("set    ", COLOR.done) : required ? paint("missing", COLOR.question, { bold: true }) : paint("missing", COLOR.meeting);
     return `  ${variable.padEnd(20)} ${status}  ${dim(set ? shownValue(variable) : note)}`.trimEnd();
   });
@@ -2660,6 +2690,8 @@ function parseCommand(command: string, args: string[]): { positionals: string[];
 
 async function main(): Promise<void> {
   if (existsSync(ENV_FILE)) process.loadEnvFile(ENV_FILE);
+  // One clock for the whole run: the planner, the grid and book agree on today and now.
+  const now = new Date();
   const [command = "", ...args] = process.argv.slice(2);
   const help = command === "help" || command === "-h" || command === "--help" || args.includes("-h") || args.includes("--help");
   if (!command || help) {
@@ -2668,7 +2700,7 @@ async function main(): Promise<void> {
       const guess = closest(topic, COMMANDS);
       throw new UsageError(`no help for "${topic}"${guess ? `; did you mean "${guess}"?` : ""}`, "node . help [<command>]", `Commands: ${COMMANDS.join(", ")}.`);
     }
-    console.log(helpText(topic === "help" ? undefined : topic));
+    console.log(helpText(topic === "help" ? undefined : topic, terminal(), now, process.env));
     return;
   }
   if (!COMMANDS.includes(command)) {
@@ -2684,16 +2716,20 @@ async function main(): Promise<void> {
   const view = flags.has("--grid") ? "grid" : flags.has("--list") ? "list" : undefined;
   if (command === "demo") {
     if (positionals.length) throw new UsageError(`demo takes only --grid or --list, got "${positionals.join(" ")}"`, usage, 'Run "node . demo --help" for details.');
-    demo(view);
+    demo(view, now);
     return;
   }
   if (command === "draft") {
     if (!positionals.length) throw new UsageError("draft needs a <range>, e.g. yesterday, week or 2026-11-03", usage, RANGE_HINT);
     // Several words join into one range, so "2026-11-02 .. 2026-11-04" works too.
     const range = positionals.join("");
-    parseRange(range, localDate(new Date()));
+    try {
+      parseRange(range, localDate(now));
+    } catch (error) {
+      throw error instanceof InvalidRange ? new UsageError(error.message, usage, RANGE_HINT) : error;
+    }
     requireEnv(DRAFT_VARIABLES);
-    await draft(range, view);
+    await draft(range, view, now);
     return;
   }
   if (positionals.length > 1) {
@@ -2705,7 +2741,7 @@ async function main(): Promise<void> {
     throw new UsageError("book needs draft lines from <file> or stdin; nothing was booked", usage, 'example: node . book --dry-run draft.txt\nRun "node . book --help" for details.');
   }
   if (file && !existsSync(file)) throw new Error(`cannot read "${file}": no such file; nothing was booked`);
-  if (!(await book(readText(file), flags.has("--dry-run")))) process.exitCode = 1;
+  if (!(await book(readText(file), flags.has("--dry-run"), now))) process.exitCode = 1;
 }
 
 /** A file or stdin as text; Windows PowerShell 5.1 writes UTF-16 with ">" and Out-File, everything else UTF-8. */
@@ -2719,17 +2755,17 @@ function readText(file?: string): string {
 if (import.meta.main) {
   main().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    const person = Boolean(process.stderr.isTTY) && !agent() && process.env.TERM !== "dumb";
-    const red = person && process.stderr.getColorDepth() > 1;
-    const bold = (text: string) => (person ? `\x1b[1m${text}\x1b[0m` : text);
+    const reader = person(process.stderr);
+    const red = reader && process.stderr.getColorDepth() > 1;
+    const bold = (text: string) => (reader ? `\x1b[1m${text}\x1b[0m` : text);
     // Room around the message at a terminal, as around the help; agents and logs keep it compact.
-    if (person) console.error("");
+    if (reader) console.error("");
     console.error(`${red ? "\x1b[1;31merror:\x1b[0m" : "error:"} ${message}`);
     if (error instanceof UsageError) {
       console.error(`${bold("usage:")} ${error.usage}`);
       console.error(error.hint);
     }
-    if (person) console.error("");
+    if (reader) console.error("");
     process.exitCode = error instanceof UsageError ? 2 : 1;
   });
 }
