@@ -1877,6 +1877,17 @@ function worklogLines(
 }
 
 const HEADER_LEAD = "# ── ";
+const BOOKED_LEAD = "#  ✓ ";
+
+/** A "#" comment wrapped at `width`; a mark stands under the ✓ of booked lines, continuations start with "#". */
+function commentLines(paint: Paint, text: string, width: number, mark = "", color?: Rgb, body = (part: string) => paint(part, COLOR.dim)): string[] {
+  const lead = mark ? BOOKED_LEAD.slice(0, BOOKED_LEAD.indexOf("✓")) : "# ";
+  const indentWidth = lead.length + (mark ? mark.length + 1 : 0);
+  return wrapWords(text, Math.max(8, width - indentWidth)).map((part, index) => {
+    const head = index === 0 ? paint(lead, COLOR.faint) + (mark ? `${paint(mark, color, { bold: true })} ` : "") : paint("#".padEnd(indentWidth), COLOR.faint);
+    return head + body(part);
+  });
+}
 
 /** `# ── Mon 2026-11-02 ━━━━━━──── 4h15m / 7h ──`, shared by the list and book's report. */
 function dayHeader(date: string, done: number, required: number, holiday: string | undefined, width: number, tty: Tty | undefined, today: string): string {
@@ -1919,21 +1930,12 @@ function printDraft({ tty, now, site }: Screen, range: string, days: DayPlan[], 
   const widths = lineWidths(days.flatMap((day) => [...day.booked, ...day.entries]));
   // Every date lines up with the weekday in the day header; book ignores the indent.
   const indent = " ".repeat(HEADER_LEAD.length);
-  const bookedPrefix = "#  ✓ ";
   const out: string[] = [];
 
-  const comment = (text: string, mark = "", color?: Rgb) => {
-    // A mark stands under the ✓ of booked lines.
-    const lead = mark ? bookedPrefix.slice(0, bookedPrefix.indexOf("✓")) : "# ";
-    const indentWidth = lead.length + (mark ? mark.length + 1 : 0);
-    wrapWords(text, Math.max(8, width - indentWidth)).forEach((part, index) => {
-      const head = index === 0 ? paint(lead, COLOR.faint) + (mark ? `${paint(mark, color, { bold: true })} ` : "") : paint("#".padEnd(indentWidth), COLOR.faint);
-      out.push(head + withKeys(part, COLOR.dim));
-    });
-  };
+  const comment = (text: string, mark = "", color?: Rgb) => out.push(...commentLines(paint, text, width, mark, color, (part) => withKeys(part, COLOR.dim)));
   const header = (date: string, done: number, required: number, holiday?: string) => out.push(dayHeader(date, done, required, holiday, width, tty, today));
   const entryLine = (entry: Entry, booked: boolean) => {
-    const lead = booked ? { text: bookedPrefix, painted: `${paint("#", COLOR.faint)}  ${paint("✓", COLOR.dim, { bold: true })} ` } : { text: indent, painted: indent };
+    const lead = booked ? { text: BOOKED_LEAD, painted: `${paint("#", COLOR.faint)}  ${paint("✓", COLOR.dim, { bold: true })} ` } : { text: indent, painted: indent };
     const link = entry.issue === "?" ? undefined : url(entry.issue);
     const look = booked ? { text: COLOR.dim, issue: COLOR.dim, link } : { issue: kindColor(entry), link };
     out.push(...worklogLines(paint, lead, entry, entry.description, widths, width, look));
