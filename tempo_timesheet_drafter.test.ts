@@ -31,6 +31,7 @@ import {
     parseLines,
     parseRange,
     planDay,
+    planDays,
     pullRequestActivities,
     pullRequestEvents,
     statusLine,
@@ -39,7 +40,7 @@ import {
     wrapFit,
     wrapWords,
 } from './tempo_timesheet_drafter.ts';
-import type { Activity, Booked, CalendarEvent, Cell, Commit, Day, DayPlan, Entry, Mark, Note, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View } from './tempo_timesheet_drafter.ts';
+import type { Activity, CalendarEvent, Cell, Commit, Day, DayPlan, Entry, Mark, Note, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View } from './tempo_timesheet_drafter.ts';
 
 // Local time decides the day and the quarter-hours; a fixed zone gives the same results on every machine and in CI.
 process.env.TZ = 'Europe/Berlin';
@@ -781,22 +782,10 @@ test('planDay against the booked days and Tempo\'s suggestions of the fixture', 
     // Arrange
     const fixture = JSON.parse(readFileSync(FIXTURE, 'utf8')) as Fixture;
     const projects = new Set(fixture.projects);
-    const existing: Array<Booked> = [];
     const captured = new Date(fixture.capturedAt);
 
     // Act
-    const planned = fixture.days.flatMap((day) => planDay(
-        day,
-        existing,
-        collapseBatches(
-            fixture.activities.filter((activity) => activity.date === day.date),
-            fixture.views.filter((view) => view.date === day.date),
-        ),
-        fixture.meetings.filter((meeting) => meeting.date === day.date),
-        projects,
-        fixture.views.filter((view) => view.date === day.date),
-        captured,
-    ).entries);
+    const planned = planDays(fixture.days, [], fixture.activities, fixture.meetings, fixture.views, projects, captured).flatMap((day) => day.entries);
 
     // Assert
     assert.deepEqual({

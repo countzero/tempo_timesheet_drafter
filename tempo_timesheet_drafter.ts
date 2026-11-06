@@ -56,6 +56,16 @@ export interface Note {
   text: string;
 }
 
+/** A day as drafted: required minutes, booked worklogs, drafted entries and notes. The demo's booked lines have no id. */
+export interface DayPlan {
+  date: string;
+  required: number;
+  holiday?: string;
+  booked: Entry[];
+  entries: Entry[];
+  notes: Note[];
+}
+
 export interface CalendarEvent {
   date: string;
   start: number;
@@ -1171,6 +1181,13 @@ function describe(activities: Activity[]): { description: string; evidence?: str
   return { description: activities.find((activity) => activity.summary)?.summary ?? DESCRIPTION_COMMIT };
 }
 
+/** Quarter-hours of the day (minute / STEP) and the issue each goes to. */
+type Owners = Map<number, string>;
+
+/**
+ * One day in quarter-hours: meetings at their time, then each free quarter-hour to the issue with the most weighted
+ * activity in it, short gaps to the issue after them, then views for what is still free.
+ */
 export function planDay(
   day: Day,
   existing: Booked[],
@@ -1180,19 +1197,27 @@ export function planDay(
   views: View[] = [],
   now = new Date(),
 ): { entries: Entry[]; notes: Note[] } {
-  const entries: Entry[] = [];
-  const notes: Note[] = [];
   const occupied: [number, number][] = existing.map((entry) => [entry.start, entry.start + entry.minutes]);
-  const overlaps = (start: number, end: number) => occupied.some(([from, to]) => from < end && start < to);
-  const required = Math.round(day.requiredSeconds / 60);
-  const bookedMinutes = totalMinutes(existing);
+  const placedMeetings = placeMeetings(day.date, meetings, existing, projects, occupied);
+  const blocked = (slot: number) => occupied.some(([from, to]) => from < (slot + 1) * STEP && slot * STEP < to);
+  const owners = ownersByActivity(activities, blocked);
+  fillGaps(owners, blocked);
+  const current = day.date === localDate(now) ? now.getHours() * 60 + now.getMinutes() : Infinity;
+  const fromViews = fillFromViews(owners, views, blocked, existing, current);
+  const entries = [...placedMeetings, ...slotEntries(day.date, owners, fromViews, activities, views)];
+  const notes = [...activityNotes(activities, entries, existing, owners, fromViews), ...hoursNote(day, existing, entries)];
+  return { entries: entries.sort((a, b) => a.start - b.start), notes };
+}
 
+/** Meetings not covered by a worklog, each with its questions; every placed meeting is added to `occupied`. */
+function placeMeetings(date: string, meetings: CalendarEvent[], existing: Booked[], projects: Set<string>, occupied: [number, number][]): Entry[] {
+  const entries: Entry[] = [];
   for (const meeting of meetings) {
     const issue = issueKey(meeting.title, projects);
     const end = meeting.start + meeting.minutes;
     const covered = existing.some((entry) => entry.start < end && meeting.start < entry.start + entry.minutes);
     if (covered || (issue && existing.some((entry) => entry.issue === issue))) continue;
-    const overlapping = overlaps(meeting.start, end);
+    const overlapping = occupied.some(([from, to]) => from < end && meeting.start < to);
     occupied.push([meeting.start, end]);
     const questions = [
       !issue && "meeting without issue key. Which issue?",
@@ -1200,7 +1225,7 @@ export function planDay(
       overlapping && "overlaps another entry. Keep both?",
     ].filter((question) => typeof question === "string");
     entries.push({
-      date: day.date,
+      date,
       start: meeting.start,
       minutes: meeting.minutes,
       issue: issue ?? "?",
@@ -1209,10 +1234,14 @@ export function planDay(
       meeting: true,
     });
   }
+  return entries;
+}
 
-  // Each quarter-hour goes to the issue with the strongest activity in it; activity during a meeting
-  // belongs to the meeting.
-  const blocked = (slot: number) => overlaps(slot * STEP, (slot + 1) * STEP);
+/**
+ * Each quarter-hour goes to the issue with the strongest activity in it; activity during a meeting belongs to the
+ * meeting. Ties go to the later minute, then to the earlier change within it, then to the key.
+ */
+function ownersByActivity(activities: Activity[], blocked: (slot: number) => boolean): Owners {
   type Strength = { score: number; last: number; lastMs: number };
   const scores = new Map<number, Map<string, Strength>>();
   const counted = new Set<string>();
@@ -1232,23 +1261,29 @@ export function planDay(
     issues.set(activity.issue, { score: current.score + WEIGHT[activity.kind], last: activity.time, lastMs: activity.ms });
     scores.set(slot, issues);
   }
-  const owners = new Map<number, string>();
+  const owners: Owners = new Map();
   for (const [slot, issues] of scores) {
     const ranked = [...issues].sort(([keyA, a], [keyB, b]) => b.score - a.score || b.last - a.last || a.lastMs - b.lastMs || keyA.localeCompare(keyB));
     owners.set(slot, ranked[0][0]);
   }
-  // Work leads up to the activity that records it, so a short gap goes to the issue after it.
-  // Longer gaps stay open: they may be breaks or absences.
+  return owners;
+}
+
+/** Work leads up to the activity that records it, so a short gap goes to the issue after it; longer gaps stay open. */
+function fillGaps(owners: Owners, blocked: (slot: number) => boolean): void {
   for (const slot of [...owners.keys()].sort((a, b) => a - b)) {
     let free = slot - 1;
     while (free >= 0 && !owners.has(free) && !blocked(free) && slot - 1 - free < MAX_GAP / STEP) free--;
     if (free < 0 || !(owners.has(free) || blocked(free))) continue;
     for (let gap = free + 1; gap < slot; gap++) owners.set(gap, owners.get(slot)!);
   }
+}
 
-  // Opening an issue is work in that quarter-hour and the free ones after it: reading leads into work. It only
-  // fills quarter-hours the activity above left open, so it never changes those.
-  const current = day.date === localDate(now) ? now.getHours() * 60 + now.getMinutes() : Infinity;
+/**
+ * Opening an issue is work in that quarter-hour and the free ones after it: reading leads into work. It only fills
+ * quarter-hours the activity left open, never past `current` (the minute now, on today). Returns the filled ones.
+ */
+function fillFromViews(owners: Owners, views: View[], blocked: (slot: number) => boolean, existing: Booked[], current: number): Set<number> {
   const bookedIssue = (slot: number) => existing.find((entry) => entry.start <= slot * STEP && slot * STEP < entry.start + entry.minutes)?.issue;
   const opens = new Map<number, Map<string, number>>();
   const anchors: [number, string][] = [];
@@ -1283,7 +1318,11 @@ export function planDay(
       fromViews.add(next);
     }
   }
+  return fromViews;
+}
 
+/** Adjacent quarter-hours of one issue as one entry, described by its activity, or by its summary when only viewed. */
+function slotEntries(date: string, owners: Owners, fromViews: Set<number>, activities: Activity[], views: View[]): Entry[] {
   const byIssue = Map.groupBy(activities.filter((activity) => activity.issue), (activity) => activity.issue!);
   const worked: Entry[] = [];
   const onlyViewed = new Set<Entry>();
@@ -1291,7 +1330,7 @@ export function planDay(
     const issue = owners.get(slot)!;
     const previous = worked.at(-1);
     if (previous?.issue === issue && previous.start + previous.minutes === slot * STEP) previous.minutes += STEP;
-    else worked.push({ date: day.date, start: slot * STEP, minutes: STEP, issue, ...describe(byIssue.get(issue) ?? []) });
+    else worked.push({ date, start: slot * STEP, minutes: STEP, issue, ...describe(byIssue.get(issue) ?? []) });
     const entry = worked.at(-1)!;
     if (entry.minutes === STEP && fromViews.has(slot)) onlyViewed.add(entry);
     else if (!fromViews.has(slot)) onlyViewed.delete(entry);
@@ -1301,10 +1340,14 @@ export function planDay(
     entry.description = views.find((view) => view.issue === entry.issue)?.summary ?? entry.description;
     entry.evidence = undefined;
   }
-  entries.push(...worked);
+  return worked;
+}
 
+/** Activity that found no line, activity without an issue key, batches and the quarter-hours filled by views. */
+function activityNotes(activities: Activity[], entries: Entry[], existing: Booked[], owners: Owners, fromViews: Set<number>): Note[] {
+  const notes: Note[] = [];
   const placed = new Set([...entries.map((entry) => entry.issue), ...existing.map((entry) => entry.issue)]);
-  const unplaced = [...byIssue.keys()].filter((issue) => !placed.has(issue));
+  const unplaced = [...new Set(activities.filter((activity) => activity.issue).map((activity) => activity.issue!))].filter((issue) => !placed.has(issue));
   if (unplaced.length) {
     const more = unplaced.length > 10 ? ` and ${unplaced.length - 10} more` : "";
     notes.push({ mark: "?", text: `also active on ${unplaced.slice(0, 10).join(", ")}${more} (during meetings or in a busier quarter-hour)` });
@@ -1329,9 +1372,15 @@ export function planDay(
     const text = spansFromViews.map(({ start, end, issue }) => `${clock(start * STEP)}${end - start > 1 ? `–${clock(end * STEP)}` : ""} ${issue}`);
     notes.push({ mark: "·", text: `viewed: ${text.join(", ")}` });
   }
+  return notes;
+}
 
-  const drafted = totalMinutes(entries);
-  const open = required - bookedMinutes - drafted;
+/** The hours still open against the required ones, with the gaps between lines. */
+function hoursNote(day: Day, existing: Booked[], entries: Entry[]): Note[] {
+  const required = Math.round(day.requiredSeconds / 60);
+  const open = required - totalMinutes(existing) - totalMinutes(entries);
+  if (open <= 0) return [];
+  if (!entries.length) return [{ mark: "?", text: `no activity found, ${duration(open)} open. What was it?` }];
   const spans = [...existing, ...entries].map((entry) => [entry.start, entry.start + entry.minutes]).sort(([a], [b]) => a - b);
   const gaps: string[] = [];
   let end = spans[0]?.[0] ?? 0;
@@ -1339,9 +1388,28 @@ export function planDay(
     if (start - end >= STEP) gaps.push(`${clock(end)}–${clock(start)}`);
     end = Math.max(end, stop);
   }
-  if (!entries.length && open > 0) notes.push({ mark: "?", text: `no activity found, ${duration(open)} open. What was it?` });
-  else if (entries.length && open > 0) notes.push({ mark: "!", text: `${duration(open)} short of ${duration(required)}${gaps.length ? `; gaps ${gaps.join(", ")}` : ""}. Anything to add?` });
-  return { entries: entries.sort((a, b) => a.start - b.start), notes };
+  return [{ mark: "!", text: `${duration(open)} short of ${duration(required)}${gaps.length ? `; gaps ${gaps.join(", ")}` : ""}. Anything to add?` }];
+}
+
+/** Every day of the range planned around its worklogs, with its activity (batches collapsed), meetings and views. */
+export function planDays(days: Day[], existing: Booked[], activities: Activity[], meetings: CalendarEvent[], views: View[], projects: Set<string>, now: Date): DayPlan[] {
+  return days.map((day) => {
+    const booked = existing.filter((entry) => entry.date === day.date).sort((a, b) => a.start - b.start);
+    const dayViews = views.filter((view) => view.date === day.date);
+    const { entries, notes } = planDay(
+      day,
+      booked,
+      collapseBatches(
+        activities.filter((activity) => activity.date === day.date),
+        dayViews,
+      ),
+      meetings.filter((meeting) => meeting.date === day.date),
+      projects,
+      dayViews,
+      now,
+    );
+    return { date: day.date, required: Math.round(day.requiredSeconds / 60), holiday: day.holiday?.name, booked, entries, notes };
+  });
 }
 
 // --- draft ----------------------------------------------------------------
@@ -1384,34 +1452,10 @@ async function draft(input: string, view: ViewName | undefined, now: Date): Prom
   bar.done();
   const [days, existing, code, reviews, meetings, tickets, projects, views] = fetched;
   const activities = [...commitActivities(code, projects), ...pullRequestActivities(reviews, projects), ...tickets];
-
-  const planned = days.map((day) => {
-    const dayExisting = existing.filter((entry) => entry.date === day.date).sort((a, b) => a.start - b.start);
-    const plan = planDay(
-      day,
-      dayExisting,
-      collapseBatches(
-        activities.filter((activity) => activity.date === day.date),
-        views.filter((view) => view.date === day.date),
-      ),
-      meetings.filter((meeting) => meeting.date === day.date),
-      projects,
-      views.filter((view) => view.date === day.date),
-      now,
-    );
-    return { day, dayExisting, ...plan };
-  });
   show(
     screen(now),
     `${from}..${to}`,
-    planned.map(({ day, dayExisting, entries, notes }) => ({
-      date: day.date,
-      required: Math.round(day.requiredSeconds / 60),
-      holiday: day.holiday?.name,
-      booked: dayExisting,
-      entries,
-      notes,
-    })),
+    planDays(days, existing, activities, meetings, views, projects, now),
     warnings,
     view,
     "",
@@ -1643,15 +1687,6 @@ function painter(tty: { depth: number; links: boolean } | undefined) {
 // --- output ---------------------------------------------------------------
 
 type ViewName = "grid" | "list";
-
-export interface DayPlan {
-  date: string;
-  required: number;
-  holiday?: string;
-  booked: Entry[];
-  entries: Entry[];
-  notes: Note[];
-}
 
 /** The Jira address of a key whose project is in `projects`, for linking keys in free text. */
 export function issueUrl(site: string | undefined, projects: Set<string>): (key: string) => string | undefined {
