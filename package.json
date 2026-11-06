@@ -1,7 +1,7 @@
 {
     "name": "tempo-timesheet-drafter",
     "description": "Drafts Tempo timesheets from GitHub commits and pull request reviews, a calendar and Jira activity, and books them.",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "license": "MIT",
     "private": true,
     "type": "module",

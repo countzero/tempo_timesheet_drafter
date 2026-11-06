@@ -5,6 +5,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.1.1] - 2026-11-06
 
+### Changed
+- Restructure the program into sections that call only those above them, with the planning, the grid layout, book's checks and the shaping of API data as pure, tested functions; the output stays the same.
+
 ### Fixed
 - Put the `!` and `✗` marks of `book`'s notes in the same column as in the draft list.
 - Retry the calendar download after a rate limit or server error, like every other request, and send the user agent with it.
