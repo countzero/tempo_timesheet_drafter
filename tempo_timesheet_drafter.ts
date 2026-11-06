@@ -1644,7 +1644,7 @@ function painter(tty: { depth: number; links: boolean } | undefined) {
 
 type ViewName = "grid" | "list";
 
-interface DayPlan {
+export interface DayPlan {
   date: string;
   required: number;
   holiday?: string;
@@ -1900,7 +1900,7 @@ function printDraft({ tty, now, site }: Screen, range: string, days: DayPlan[], 
 
 // --- grid -----------------------------------------------------------------
 
-interface Cell {
+export interface Cell {
   ch: string;
   fg?: Rgb;
   bg?: Rgb;
@@ -1911,7 +1911,7 @@ interface Cell {
   block?: boolean;
 }
 
-interface Item extends Entry {
+export interface Item extends Entry {
   booked: boolean;
   row: number;
   end: number;
@@ -1995,34 +1995,18 @@ export function lanes(entries: { entry: Entry; booked: boolean }[], maxLanes: nu
   return { placed, hidden };
 }
 
-/**
- * The week as a time grid for a person at a terminal: a column per day, four rows per hour, each entry a block in its
- * source's color with a darker stripe, booked entries muted with "✓", the one running now orange. The rule under each
- * day fills toward its required hours. Questions and missing hours follow below.
- */
-function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: string[], subtitle: string, projects: Set<string>): void {
-  const { tty, now, site } = screen;
-  const depth = tty?.depth ?? 1;
-  const color = depth > 1;
-  const paint = painter(tty);
-  const url = dayLinks(days, projects, site);
-  const withKeys = keyLinker(paint, url);
-  const shown = days.filter((day) => day.required > 0 || day.holiday || day.booked.length || day.entries.length);
-  const all = shown.flatMap((day) => [...day.booked, ...day.entries]);
-  const first = Math.min(8 * 60, ...all.map((entry) => entry.start));
-  const last = Math.max(17 * 60, ...all.map((entry) => entry.start + entry.minutes));
-  const hours: [number, number] = [Math.floor(first / 60), Math.min(24, Math.ceil(last / 60))];
-  const width = tty ? tty.width - 1 : 120;
-  const gutter = 6;
-  const columnWidth = Math.floor((width - gutter) / Math.max(1, shown.length)) - 1;
-  if (!shown.length || columnWidth < 8) {
-    printDraft(screen, range, days, warnings, subtitle, projects);
-    return;
-  }
+/** Cells drawn by position; rows appear as they are first touched, all `columns` wide. */
+interface Canvas {
+  rows: Cell[][];
+  at(x: number, y: number): Cell;
+  put(x: number, y: number, ch: string, look?: Omit<Cell, "ch">): void;
+  text(x: number, y: number, value: string, look?: Omit<Cell, "ch">): void;
+}
 
+function canvas(columns: number): Canvas {
   const rows: Cell[][] = [];
   const at = (x: number, y: number): Cell => {
-    while (rows.length <= y) rows.push(Array.from({ length: gutter + shown.length * (columnWidth + 1) }, () => ({ ch: " " })));
+    while (rows.length <= y) rows.push(Array.from({ length: columns }, () => ({ ch: " " })));
     return rows[y][x];
   };
   const put = (x: number, y: number, ch: string, look: Omit<Cell, "ch"> = {}) => {
@@ -2036,26 +2020,75 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
       x++;
     }
   };
+  return { rows, at, put, text };
+}
 
-  const top = 2;
-  const today = localDate(now);
-  const xs = shown.map((_, index) => gutter + index * (columnWidth + 1) + 1);
-  const rowCount = (hours[1] - hours[0]) * ROWS_PER_HOUR;
+/** Where the grid's parts go: the first row of blocks, the hours shown, each day's first column and the column width. */
+interface Frame {
+  top: number;
+  hours: [number, number];
+  xs: number[];
+  columnWidth: number;
+  today: string;
+  minute: number;
+  depth: number;
+  url: (key: string) => string | undefined;
+}
+
+/** The days the grid shows: work days, holidays, and any day with entries. */
+function gridDays(days: DayPlan[]): DayPlan[] {
+  return days.filter((day) => day.required > 0 || day.holiday || day.booked.length || day.entries.length);
+}
+
+/**
+ * The grid's cells for `days` at `width` columns, and the entries it cannot show (outside the hours or too many
+ * overlaps); undefined when the columns would be narrower than 8 cells.
+ */
+export function layoutGrid(days: DayPlan[], now: Date, width: number, depth: number, url: (key: string) => string | undefined): { rows: Cell[][]; hidden: Item[] } | undefined {
+  const shown = gridDays(days);
+  const all = shown.flatMap((day) => [...day.booked, ...day.entries]);
+  const first = Math.min(8 * 60, ...all.map((entry) => entry.start));
+  const last = Math.max(17 * 60, ...all.map((entry) => entry.start + entry.minutes));
+  const gutter = 6;
+  const columnWidth = Math.floor((width - gutter) / Math.max(1, shown.length)) - 1;
+  if (!shown.length || columnWidth < 8) return undefined;
+
+  const grid = canvas(gutter + shown.length * (columnWidth + 1));
+  const frame: Frame = {
+    top: 2,
+    hours: [Math.floor(first / 60), Math.min(24, Math.ceil(last / 60))],
+    xs: shown.map((_, index) => gutter + index * (columnWidth + 1) + 1),
+    columnWidth,
+    today: localDate(now),
+    minute: now.getHours() * 60 + now.getMinutes(),
+    depth,
+    url,
+  };
+  drawHeader(grid, shown, frame);
+  drawHourLines(grid, frame);
+  const hidden = drawBlocks(grid, shown, frame);
+  drawNow(grid, shown, frame);
+  return { rows: grid.rows, hidden };
+}
+
+/** Per day its name and hours, then a rule that fills toward the required hours like the list's header rule. */
+function drawHeader({ rows, put, text }: Canvas, shown: DayPlan[], { xs, columnWidth, today }: Frame): void {
   shown.forEach((day, index) => {
     const done = totalMinutes([...day.booked, ...day.entries]);
     const full = done >= day.required;
-    const name = `${weekdayName(day.date)} ${day.date.slice(8)}`;
     const amount = dayAmount(done, day.required, day.holiday, "/", true);
-    const label = fitBoth(name, amount, columnWidth);
+    const label = fitBoth(`${weekdayName(day.date)} ${day.date.slice(8)}`, amount, columnWidth);
     put(xs[index] - 1, 0, "│", { fg: COLOR.faint });
     text(xs[index], 0, label, { bold: true, fg: day.date === today ? COLOR.attention : day.holiday ? COLOR.dim : undefined });
     if (amount && label.endsWith(amount)) text(xs[index] + columnWidth - textWidth(amount), 0, amount, { bold: true, fg: day.holiday ? COLOR.dim : full ? COLOR.done : undefined });
-    // The rule under the day fills like the list's header rule.
     const filled = filledCells(done, day.required, columnWidth);
     for (let dx = 0; dx < columnWidth; dx++) put(xs[index] + dx, 1, dx < filled ? "━" : "─", { fg: dx >= filled ? COLOR.faint : full ? COLOR.done : COLOR.dim });
   });
   for (let x = 0; x < rows[0].length; x++) if (!xs.some((start) => x >= start && x < start + columnWidth)) put(x, 1, xs.includes(x + 1) ? "┼" : "─", { fg: COLOR.faint });
-  for (let y = 0; y < rowCount; y++) {
+}
+
+function drawHourLines({ put, text }: Canvas, { top, hours, xs, columnWidth }: Frame): void {
+  for (let y = 0; y < (hours[1] - hours[0]) * ROWS_PER_HOUR; y++) {
     const minute = hours[0] * 60 + (y * 60) / ROWS_PER_HOUR;
     if (minute % 60 === 0) text(0, top + y, clock(minute), { fg: COLOR.dim });
     for (const x of xs) {
@@ -2063,18 +2096,33 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
       if (minute % 60 === 0 && y > 0) for (let dx = 0; dx < columnWidth; dx++) put(x + dx, top + y, "┈", { fg: COLOR.faint });
     }
   }
+}
 
-  const minute = now.getHours() * 60 + now.getMinutes();
-  const hiddenItems: Item[] = [];
+/**
+ * Full source color: dimmed tints measured worse contrast and looked muddy. Booked blocks are muted toward gray, like
+ * the gray booked lines of the list. The entry running now takes the color of the now line.
+ */
+function blockLook(item: Item, running: boolean, depth: number): { bg?: Rgb; fg?: Rgb; stripe: Rgb } {
+  const accent = running ? COLOR.attention : kindColor(item);
+  const bg = depth > 1 ? (item.booked && !running ? mix(accent, [128, 128, 128], 0.45) : accent) : undefined;
+  // With 16 colors the darker shade maps back to the block color, so the stripe turns black.
+  const stripe: Rgb = !bg ? accent : depth === 4 ? [0, 0, 0] : mix(bg, [0, 0, 0], 0.5);
+  return { bg, fg: bg ? textOn(bg) : undefined, stripe };
+}
+
+/** Each entry as a block in its lane; returns the entries left out. */
+function drawBlocks(grid: Canvas, shown: DayPlan[], frame: Frame): Item[] {
+  const { top, hours, xs, columnWidth, today, minute } = frame;
+  const hidden: Item[] = [];
   const blocks: { x: number; y: number; w: number }[] = [];
   shown.forEach((day, index) => {
-    const { placed, hidden } = lanes(dayItems(day), Math.max(1, Math.floor((columnWidth + 1) / 7)));
-    hiddenItems.push(...hidden);
-    for (const item of placed) {
+    const laid = lanes(dayItems(day), Math.max(1, Math.floor((columnWidth + 1) / 7)));
+    hidden.push(...laid.hidden);
+    for (const item of laid.placed) {
       const from = Math.max(item.start, hours[0] * 60);
       const to = Math.min(item.start + item.minutes, hours[1] * 60);
       if (to <= from) {
-        hiddenItems.push(item);
+        hidden.push(item);
         continue;
       }
       const y = top + Math.floor(((from - hours[0] * 60) * ROWS_PER_HOUR) / 60);
@@ -2082,51 +2130,70 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
       const edge = (lane: number) => Math.floor((lane * (columnWidth + 1)) / item.lanes);
       const x = xs[index] + edge(item.lane);
       const w = edge(item.lane + item.span) - 1 - edge(item.lane);
-      // Full source color: dimmed tints measured worse contrast and looked muddy. Booked blocks are muted toward gray,
-      // like the gray booked lines of the list. The entry running now takes the color of the now line.
       const running = day.date === today && item.start <= minute && minute < item.start + item.minutes;
-      const accent = running ? COLOR.attention : kindColor(item);
-      const bg = color ? (item.booked && !running ? mix(accent, [128, 128, 128], 0.45) : accent) : undefined;
-      const fg = bg ? textOn(bg) : undefined;
-      // With 16 colors the darker shade maps back to the block color, so the stripe turns black.
-      const stripe: Rgb = !bg ? accent : depth === 4 ? [0, 0, 0] : mix(bg, [0, 0, 0], 0.5);
-      for (let dy = 0; dy < h; dy++) {
-        put(x, y + dy, "▌", { fg: stripe, bg, block: true });
-        // Every cell carries the text color: terminals draw the separator line in it, and empty cells would use the default.
-        for (let dx = 1; dx < w; dx++) put(x + dx, y + dy, " ", { fg, bg, block: true });
-      }
-      // One free cell on the right mirrors the gap the half-width stripe leaves on the left.
-      const labelWidth = w - 2;
-      const prefix = item.booked ? "✓ " : "";
-      const name = `${prefix}${item.issue} ${item.description}`;
-      const title: Omit<Cell, "ch"> = { fg, bg, bold: true, block: true };
-      if (h === 1) text(x + 1, y, fitBoth(name, duration(item.minutes), labelWidth), title);
-      else {
-        wrapFit(name, labelWidth, h - 1).forEach((line, line_) => text(x + 1, y + line_, line, title));
-        const span = `${clock(item.start)}–${clock(item.start + item.minutes)}`;
-        const spent = duration(item.minutes);
-        const meta = fitBoth(textWidth(span) + 1 + textWidth(spent) <= labelWidth ? span : "", spent, labelWidth);
-        text(x + 1, y + h - 1, meta, { fg: fg && bg ? mix(fg, bg, 0.75) : COLOR.dim, bg, block: true });
-      }
-      const link = item.issue === "?" ? undefined : url(item.issue);
-      if (link) {
-        for (let dx = 0; dx < Math.min(item.issue.length, labelWidth - prefix.length); dx++) at(x + 1 + prefix.length + dx, y).link = link;
-      }
+      drawBlock(grid, item, { x, y, w, h }, blockLook(item, running, frame.depth), frame.url);
       blocks.push({ x, y, w });
     }
   });
   for (const { x, y, w } of blocks) {
-    for (let dx = 0; dx < w; dx++) if (y > top && at(x + dx, y - 1).block) at(x + dx, y).overline = true;
+    for (let dx = 0; dx < w; dx++) if (y > top && grid.at(x + dx, y - 1).block) grid.at(x + dx, y).overline = true;
   }
+  return hidden;
+}
 
-  const todayIndex = shown.findIndex((day) => day.date === today);
-  if (todayIndex >= 0 && minute >= hours[0] * 60 && minute < hours[1] * 60) {
-    const row = Math.floor(((minute - hours[0] * 60) * ROWS_PER_HOUR) / 60);
-    const rowStart = hours[0] * 60 + (row * 60) / ROWS_PER_HOUR;
-    text(0, top + row, clock(rowStart % 60 === 0 ? rowStart : minute), { fg: COLOR.attention, bold: true });
-    // Blocks keep their text; the one running now is orange instead.
-    for (let dx = 0; dx < columnWidth; dx++) if (!at(xs[todayIndex] + dx, top + row).block) put(xs[todayIndex] + dx, top + row, "─", { fg: COLOR.attention });
+function drawBlock({ at, put, text }: Canvas, item: Item, { x, y, w, h }: { x: number; y: number; w: number; h: number }, look: { bg?: Rgb; fg?: Rgb; stripe: Rgb }, url: (key: string) => string | undefined): void {
+  const { bg, fg, stripe } = look;
+  for (let dy = 0; dy < h; dy++) {
+    put(x, y + dy, "▌", { fg: stripe, bg, block: true });
+    // Every cell carries the text color: terminals draw the separator line in it, and empty cells would use the default.
+    for (let dx = 1; dx < w; dx++) put(x + dx, y + dy, " ", { fg, bg, block: true });
   }
+  // One free cell on the right mirrors the gap the half-width stripe leaves on the left.
+  const labelWidth = w - 2;
+  const prefix = item.booked ? "✓ " : "";
+  const name = `${prefix}${item.issue} ${item.description}`;
+  const title: Omit<Cell, "ch"> = { fg, bg, bold: true, block: true };
+  if (h === 1) text(x + 1, y, fitBoth(name, duration(item.minutes), labelWidth), title);
+  else {
+    wrapFit(name, labelWidth, h - 1).forEach((line, index) => text(x + 1, y + index, line, title));
+    const span = `${clock(item.start)}–${clock(item.start + item.minutes)}`;
+    const spent = duration(item.minutes);
+    const meta = fitBoth(textWidth(span) + 1 + textWidth(spent) <= labelWidth ? span : "", spent, labelWidth);
+    text(x + 1, y + h - 1, meta, { fg: fg && bg ? mix(fg, bg, 0.75) : COLOR.dim, bg, block: true });
+  }
+  const link = item.issue === "?" ? undefined : url(item.issue);
+  if (link) {
+    for (let dx = 0; dx < Math.min(item.issue.length, labelWidth - prefix.length); dx++) at(x + 1 + prefix.length + dx, y).link = link;
+  }
+}
+
+/** The time in the gutter and a line through today's free cells; the block running now is orange already. */
+function drawNow({ at, put, text }: Canvas, shown: DayPlan[], { top, hours, xs, columnWidth, today, minute }: Frame): void {
+  const todayIndex = shown.findIndex((day) => day.date === today);
+  if (todayIndex < 0 || minute < hours[0] * 60 || minute >= hours[1] * 60) return;
+  const row = Math.floor(((minute - hours[0] * 60) * ROWS_PER_HOUR) / 60);
+  const rowStart = hours[0] * 60 + (row * 60) / ROWS_PER_HOUR;
+  text(0, top + row, clock(rowStart % 60 === 0 ? rowStart : minute), { fg: COLOR.attention, bold: true });
+  for (let dx = 0; dx < columnWidth; dx++) if (!at(xs[todayIndex] + dx, top + row).block) put(xs[todayIndex] + dx, top + row, "─", { fg: COLOR.attention });
+}
+
+/**
+ * The week as a time grid for a person at a terminal: a column per day, four rows per hour, each entry a block in its
+ * source's color with a darker stripe, booked entries muted with "✓", the one running now orange. The rule under each
+ * day fills toward its required hours. Questions and missing hours follow below.
+ */
+function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: string[], subtitle: string, projects: Set<string>): void {
+  const { tty, now, site } = screen;
+  const paint = painter(tty);
+  const url = dayLinks(days, projects, site);
+  const withKeys = keyLinker(paint, url);
+  const width = tty ? tty.width - 1 : 120;
+  const layout = layoutGrid(days, now, width, tty?.depth ?? 1, url);
+  if (!layout) {
+    printDraft(screen, range, days, warnings, subtitle, projects);
+    return;
+  }
+  const today = localDate(now);
 
   const out: string[] = [];
   const heading = `Draft ${range}`;
@@ -2144,16 +2211,18 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
     ),
     "",
   );
-  out.push(...renderCells(rows, tty));
+  out.push(...renderCells(layout.rows, tty));
 
   const listed = (item: Entry & { booked?: boolean }) =>
     `  ${paint(`${weekday(item.date)} ${item.date.slice(5)} ${clock(item.start)}–${clock(item.start + item.minutes)}`, COLOR.dim)} ` +
     `${paint(duration(item.minutes).padStart(5), undefined, { bold: true })}  ${paint(item.issue, kindColor(item), { bold: true, link: item.issue === "?" ? undefined : url(item.issue) })}  ${fit(item.description, Math.max(20, width - 40))}`;
-  if (hiddenItems.length) {
+  if (layout.hidden.length) {
     out.push("", paint("Not in the grid (outside the hours or too many overlaps):", COLOR.dim));
-    for (const item of hiddenItems.sort((a, b) => a.date.localeCompare(b.date) || a.start - b.start)) out.push(listed(item));
+    for (const item of layout.hidden.sort((a, b) => a.date.localeCompare(b.date) || a.start - b.start)) out.push(listed(item));
   }
-  const open = shown.map((day) => ({ day, notes: dayNotes(day.entries, day.notes).filter((note) => note.mark !== "·") })).filter(({ notes }) => notes.length);
+  const open = gridDays(days)
+    .map((day) => ({ day, notes: dayNotes(day.entries, day.notes).filter((note) => note.mark !== "·") }))
+    .filter(({ notes }) => notes.length);
   for (const { day, notes } of open) {
     out.push("", paint(`${weekdayName(day.date)} ${day.date}`, day.date === today ? COLOR.attention : undefined, { bold: true }));
     for (const note of notes) {

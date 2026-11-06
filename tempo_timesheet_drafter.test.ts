@@ -25,6 +25,7 @@ import {
     issueUrl,
     keyPieces,
     lanes,
+    layoutGrid,
     parseCalendar,
     parseDuration,
     parseLines,
@@ -38,7 +39,7 @@ import {
     wrapFit,
     wrapWords,
 } from './tempo_timesheet_drafter.ts';
-import type { Activity, Booked, CalendarEvent, Commit, Day, Entry, Mark, Note, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View } from './tempo_timesheet_drafter.ts';
+import type { Activity, Booked, CalendarEvent, Cell, Commit, Day, DayPlan, Entry, Mark, Note, PullRequestComment, PullRequestEvent, ReviewedPullRequest, Source, View } from './tempo_timesheet_drafter.ts';
 
 // Local time decides the day and the quarter-hours; a fixed zone gives the same results on every machine and in CI.
 process.env.TZ = 'Europe/Berlin';
@@ -694,6 +695,34 @@ test('fit, fitBoth, wrapFit and wrapWords measure in cells, wide characters coun
     assert.equal(fitBoth('Monday long', '8h', 8), 'Mond… 8h');
     assert.deepEqual(wrapFit('one two three four', 9, 2), ['one two', 'three fo…']);
     assert.deepEqual(wrapWords('aaaaaaaaaa bb', 4), ['aaaa', 'aaaa', 'aa', 'bb']);
+});
+
+test('layoutGrid fills the rule toward the required hours, colors the entry running now and draws the now line in free cells', () => {
+
+    // Arrange
+    const day: DayPlan = {
+        date: DAY.date,
+        required: 60,
+        booked: [],
+        entries: [{ date: DAY.date, start: 570, minutes: 30, issue: 'SHOP-1', description: 'Review' }],
+        notes: [],
+    };
+    const text = (rows: Array<Array<Cell>>) => rows.map((row) => row.map((cell) => cell.ch).join('').trimEnd());
+
+    // Act
+    const during = layoutGrid([day], new Date(`${DAY.date}T09:40:00`), 30, 24, () => undefined);
+    const after = layoutGrid([day], new Date(`${DAY.date}T10:10:00`), 30, 24, () => undefined);
+    const narrow = layoutGrid([day], new Date(`${DAY.date}T10:10:00`), 14, 24, () => undefined);
+
+    // Assert
+    assert.ok(during && after);
+    assert.deepEqual(text(during.rows).slice(0, 2), ['      │Tue 03           30m/1h', `──────┼${'━'.repeat(12)}${'─'.repeat(11)}`]);
+    assert.equal(text(during.rows)[8], '09:40 │▌SHOP-1 Review');
+    assert.deepEqual(during.rows[8][8].bg, [213, 94, 0]);
+    assert.deepEqual(after.rows[8][8].bg, [86, 180, 233]);
+    assert.equal(text(after.rows)[10], `10:00 │${'─'.repeat(23)}`);
+    assert.deepEqual(during.hidden, []);
+    assert.equal(narrow, undefined);
 });
 
 interface Span {
