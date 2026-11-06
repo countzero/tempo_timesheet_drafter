@@ -678,22 +678,26 @@ async function commits(
   const since = startOfDay(from);
   const viewer = await viewerRequest;
   const owners = githubOwners();
-  const queue = (await Promise.all(owners.map((owner) => repositories(owner, since)))).flat();
-  const total = queue.length;
+  const names = (await Promise.all(owners.map((owner) => repositories(owner, since)))).flat();
   let skipped = 0;
-  onRepositories(total, skipped);
-  const histories: HistoryPage["nodes"][] = [];
+  onRepositories(names.length, skipped);
+  // Results by repository, not by which request finished first, so commits and warnings keep one order.
+  const histories: Commit[][] = [];
+  const failures: string[] = [];
+  let next = 0;
   const worker = async () => {
-    for (let repository = queue.shift(); repository; repository = queue.shift()) {
+    while (next < names.length) {
+      const index = next++;
       try {
-        histories.push(await history(repository, since, viewer.id));
+        histories[index] = await history(names[index], since, viewer.id);
       } catch (error) {
-        onRepositories(total, ++skipped);
-        warnings.push(`skipped ${repository}: ${errorMessage(error)}`);
+        onRepositories(names.length, ++skipped);
+        failures[index] = `skipped ${names[index]}: ${errorMessage(error)}`;
       }
     }
   };
   await Promise.all(Array.from({ length: 8 }, worker));
+  warnings.push(...failures.filter(Boolean));
   return authoredIn(histories.flat(), from, to);
 }
 
@@ -1478,19 +1482,21 @@ async function draft(input: string, view: ViewName | undefined, now: Date): Prom
   const to = requestedTo > today ? today : requestedTo;
   if (from > to) throw new UsageError(`${from} is in the future (today is ${weekday(today)} ${today})`, COMMANDS.draft.usage, RANGE_HINT);
 
-  const warnings: string[] = [];
+  // One list per source, joined in a fixed order: the sources run in parallel and would mix their warnings.
+  const sourceWarnings = { commits: [] as string[], pullRequests: [] as string[], calendar: [] as string[] };
   // Steps are the requests until a source is finished; GitHub counts its repositories separately.
   const bar = progress({ Tempo: 2, Jira: 4, Calendar: 1, GitHub: 2 });
   let fetched: [Day[], Booked[], Commit[], PullRequestEvent[], CalendarEvent[], Activity[], Set<string>, View[]];
   try {
     // GitHub and the calendar need nothing from Jira, so they start with the first requests.
     const user = viewer();
-    const history = bar.track("GitHub", commits(from, to, user, warnings, (total, skipped) => bar.count("GitHub", total, "repos", skipped)), (found) => `${found.length} commits`);
-    const pulls = bar.track("GitHub", pullRequests(from, to, user, warnings), (found) => {
+    const counted = (total: number, skipped: number) => bar.count("GitHub", total, "repos", skipped);
+    const history = bar.track("GitHub", commits(from, to, user, sourceWarnings.commits, counted), (found) => `${found.length} commits`);
+    const pulls = bar.track("GitHub", pullRequests(from, to, user, sourceWarnings.pullRequests), (found) => {
       const reviews = found.filter((event) => event.kind === "pr-review").length;
       return `${reviews} reviews, ${found.length - reviews} comments`;
     });
-    const events = bar.track("Calendar", calendar(from, to, warnings), (found) => `${found.length} meetings`);
+    const events = bar.track("Calendar", calendar(from, to, sourceWarnings.calendar), (found) => `${found.length} meetings`);
     // Awaited later; without a handler, a failure during the first requests would make them unhandled rejections.
     for (const early of [user, history, pulls, events]) early.catch(() => {});
     const [account, projects, days] = await Promise.all([bar.track("Jira", accountId()), bar.track("Jira", projectKeys()), bar.track("Tempo", schedule(from, to))]);
@@ -1514,7 +1520,7 @@ async function draft(input: string, view: ViewName | undefined, now: Date): Prom
     screen(now),
     `${from}..${to}`,
     planDays(days, existing, activities, meetings, views, projects, now),
-    warnings,
+    [...sourceWarnings.commits, ...sourceWarnings.pullRequests, ...sourceWarnings.calendar],
     view,
     "",
     projects,
