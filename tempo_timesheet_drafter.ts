@@ -218,8 +218,31 @@ export function duration(minutes: number): string {
   return `${hours ? `${hours}h` : ""}${rest || !hours ? `${rest}m` : ""}`;
 }
 
+/** "09:30–10:00". */
+function timeSpan(entry: { start: number; minutes: number }): string {
+  return `${clock(entry.start)}–${clock(entry.start + entry.minutes)}`;
+}
+
 function totalMinutes(entries: { minutes: number }[]): number {
   return entries.reduce((sum, entry) => sum + entry.minutes, 0);
+}
+
+function requiredOf(day: Day): number {
+  return Math.round(day.requiredSeconds / 60);
+}
+
+/** Minutes since local midnight. */
+function minuteOf(value: Date): number {
+  return value.getHours() * 60 + value.getMinutes();
+}
+
+function inRange(date: string, from: string, to: string): boolean {
+  return date >= from && date <= to;
+}
+
+/** Local midnight of `date` as an ISO timestamp, for APIs that filter by time. */
+function startOfDay(date: string): string {
+  return new Date(`${date}T00:00:00`).toISOString();
 }
 
 function localDate(value: Date): string {
@@ -298,8 +321,13 @@ export function isoWeek(date: string): number {
 
 // --- issue keys -----------------------------------------------------------
 
+/** "SHOP" for "SHOP-12". */
+function projectOf(key: string): string {
+  return key.slice(0, key.lastIndexOf("-"));
+}
+
 export function issueKey(text: string, projects: Set<string>): string | undefined {
-  return text.match(ISSUE_KEY)?.find((key) => projects.has(key.slice(0, key.lastIndexOf("-"))));
+  return text.match(ISSUE_KEY)?.find((key) => projects.has(projectOf(key)));
 }
 
 export function withoutKey(text: string, key: string): string {
@@ -451,9 +479,9 @@ export function jiraActivities(issues: JiraIssue[], more: Map<string, JiraCommen
   const add = (stamp: string | number, issue: JiraIssue, text: string) => {
     const at = new Date(stamp);
     const date = localDate(at);
-    if (date < from || date > to) return;
+    if (!inRange(date, from, to)) return;
     const parent = issue.fields.parent && { key: issue.fields.parent.key, summary: issue.fields.parent.fields.summary };
-    result.push({ date, time: at.getHours() * 60 + at.getMinutes(), ms: at.getTime(), issue: issue.key, kind: "jira", text, summary: issue.fields.summary, parent });
+    result.push({ date, time: minuteOf(at), ms: at.getTime(), issue: issue.key, kind: "jira", text, summary: issue.fields.summary, parent });
   };
   for (const issue of issues) {
     if (issue.fields.creator?.accountId === account) add(issue.fields.created, issue, "created");
@@ -484,8 +512,8 @@ export function viewsIn(issues: ViewedIssue[], from: string, to: string): View[]
   const views: View[] = [];
   for (const issue of issues) {
     const at = new Date(issue.fields.lastViewed);
-    if (localDate(at) < from || localDate(at) > to) continue;
-    views.push({ date: localDate(at), time: at.getHours() * 60 + at.getMinutes(), ms: at.getTime(), issue: issue.key, summary: issue.fields.summary });
+    if (!inRange(localDate(at), from, to)) continue;
+    views.push({ date: localDate(at), time: minuteOf(at), ms: at.getTime(), issue: issue.key, summary: issue.fields.summary });
   }
   return views.sort((a, b) => a.ms - b.ms);
 }
@@ -652,7 +680,7 @@ async function commits(
   onRepositories: (total: number, skipped: number) => void = () => {},
 ): Promise<Commit[]> {
   // The history filter `since` compares the committer date; the authored date decides the day.
-  const since = new Date(`${from}T00:00:00`).toISOString();
+  const since = startOfDay(from);
   const viewer = await viewerRequest;
   const owners = githubOwners();
   const queue = (await Promise.all(owners.map((owner) => repositories(owner, since)))).flat();
@@ -681,7 +709,7 @@ export function authoredIn(nodes: Commit[], from: string, to: string): Commit[] 
     if (seen.has(node.oid)) return false;
     seen.add(node.oid);
     const date = localDate(new Date(node.authoredDate));
-    return date >= from && date <= to;
+    return inRange(date, from, to);
   });
 }
 
@@ -697,7 +725,7 @@ export function commitActivities(commits: Commit[], projects: Set<string>): Acti
     if (merge && !review && !issue) continue;
     result.push({
       date,
-      time: authored.getHours() * 60 + authored.getMinutes(),
+      time: minuteOf(authored),
       ms: authored.getTime(),
       issue,
       kind: review ? "review" : merge ? "merge" : "commit",
@@ -774,7 +802,7 @@ const SEARCH_LIMIT = 1000;
 async function pullRequests(from: string, to: string, viewerRequest: Promise<Viewer>, warnings: string[]): Promise<PullRequestEvent[]> {
   const { login } = await viewerRequest;
   const owners = githubOwners();
-  const since = new Date(`${from}T00:00:00`).toISOString();
+  const since = startOfDay(from);
   const reviewed = new Map<string, ReviewedPullRequest>();
   for (const owner of owners) {
     const query = `is:pr reviewed-by:@me ${owner.includes("/") ? "repo" : "user"}:${owner} updated:>=${addDays(from, -SEARCH_LEAD_DAYS)}`;
@@ -836,7 +864,7 @@ export function pullRequestEvents(
   const result: PullRequestEvent[] = [];
   const add = (stamp: string, kind: PullRequestEvent["kind"], pullRequest: PullRequestNode) => {
     const at = new Date(stamp);
-    if (localDate(at) < from || localDate(at) > to) return;
+    if (!inRange(localDate(at), from, to)) return;
     result.push({
       ms: at.getTime(),
       kind,
@@ -868,7 +896,7 @@ export function pullRequestActivities(events: PullRequestEvent[], projects: Set<
     const issue = issueKey(branch.toUpperCase().replace(/[_/]/g, " "), projects) ?? issueKey(title, projects);
     return {
       date: localDate(at),
-      time: at.getHours() * 60 + at.getMinutes(),
+      time: minuteOf(at),
       ms: event.ms,
       issue,
       kind: event.kind,
@@ -998,7 +1026,7 @@ function toLocal(stamp: Stamp, zones: Map<string, Transition[]>): { date: string
   const ms = epoch(stamp, zones);
   if (ms === undefined) return { date: stamp.date, start: stamp.time };
   const local = new Date(ms);
-  return { date: localDate(local), start: local.getHours() * 60 + local.getMinutes() };
+  return { date: localDate(local), start: minuteOf(local) };
 }
 
 function moment(value: { date: string; start: number }): string {
@@ -1142,7 +1170,7 @@ export function parseCalendar(raw: Buffer, from: string, to: string, email = "")
     ];
     for (const occurrence of occurrences) {
       const local = toLocal(occurrence, zones);
-      if (local.date < from || local.date > to) continue;
+      if (!inRange(local.date, from, to)) continue;
       if (series && (excludedDays.has(occurrence.date) || excluded.has(moment(local)) || overridden.has(`${uid} ${moment(local)}`))) continue;
       events.push({ ...local, minutes, title, tentative });
     }
@@ -1236,7 +1264,7 @@ export function planDay(
   const blocked = (slot: number) => occupied.some(([from, to]) => from < (slot + 1) * STEP && slot * STEP < to);
   const owners = ownersByActivity(activities, blocked);
   fillGaps(owners, blocked);
-  const current = day.date === localDate(now) ? now.getHours() * 60 + now.getMinutes() : Infinity;
+  const current = day.date === localDate(now) ? minuteOf(now) : Infinity;
   const fromViews = fillFromViews(owners, views, blocked, existing, current);
   const entries = [...placedMeetings, ...slotEntries(day.date, owners, fromViews, activities, views)];
   const notes = [...activityNotes(activities, entries, existing, owners, fromViews), ...hoursNote(day, existing, entries)];
@@ -1411,7 +1439,7 @@ function activityNotes(activities: Activity[], entries: Entry[], existing: Booke
 
 /** The hours still open against the required ones, with the gaps between lines. */
 function hoursNote(day: Day, existing: Booked[], entries: Entry[]): Note[] {
-  const required = Math.round(day.requiredSeconds / 60);
+  const required = requiredOf(day);
   const open = required - totalMinutes(existing) - totalMinutes(entries);
   if (open <= 0) return [];
   if (!entries.length) return [{ mark: "?", text: `no activity found, ${duration(open)} open. What was it?` }];
@@ -1442,7 +1470,7 @@ export function planDays(days: Day[], existing: Booked[], activities: Activity[]
       dayViews,
       now,
     );
-    return { date: day.date, required: Math.round(day.requiredSeconds / 60), holiday: day.holiday?.name, booked, entries, notes };
+    return { date: day.date, required: requiredOf(day), holiday: day.holiday?.name, booked, entries, notes };
   });
 }
 
@@ -1725,7 +1753,7 @@ type ViewName = "grid" | "list";
 /** The Jira address of a key whose project is in `projects`, for linking keys in free text. */
 export function issueUrl(site: string | undefined, projects: Set<string>): (key: string) => string | undefined {
   const base = site?.replace(/\/$/, "");
-  return (key) => (base && projects.has(key.slice(0, key.lastIndexOf("-"))) ? `${base}/browse/${key}` : undefined);
+  return (key) => (base && projects.has(projectOf(key)) ? `${base}/browse/${key}` : undefined);
 }
 
 /** `text` cut into plain pieces and the issue keys `url` knows, each with its address. */
@@ -1746,7 +1774,7 @@ export function keyPieces(text: string, url: (key: string) => string | undefined
 /** Keys of the Jira projects and of every line shown link; "?" and made-up words such as UTF-8 do not. */
 function dayLinks(days: DayPlan[], projects: Set<string>, site: string | undefined): (key: string) => string | undefined {
   const issues = days.flatMap((day) => [...day.booked, ...day.entries]).filter((entry) => entry.issue !== "?");
-  return issueUrl(site, new Set([...projects, ...issues.map((entry) => entry.issue.slice(0, entry.issue.lastIndexOf("-")))]));
+  return issueUrl(site, new Set([...projects, ...issues.map((entry) => projectOf(entry.issue))]));
 }
 
 const NOTE_ORDER: Mark[] = ["?", "!", "·"];
@@ -2129,7 +2157,7 @@ export function layoutGrid(days: DayPlan[], now: Date, width: number, depth: num
     xs: shown.map((_, index) => gutter + index * (columnWidth + 1) + 1),
     columnWidth,
     today: localDate(now),
-    minute: now.getHours() * 60 + now.getMinutes(),
+    minute: minuteOf(now),
     depth,
     url,
   };
@@ -2225,7 +2253,7 @@ function drawBlock({ at, put, text }: Canvas, item: Item, { x, y, w, h }: { x: n
   if (h === 1) text(x + 1, y, fitBoth(name, duration(item.minutes), labelWidth), title);
   else {
     wrapFit(name, labelWidth, h - 1).forEach((line, index) => text(x + 1, y + index, line, title));
-    const span = `${clock(item.start)}–${clock(item.start + item.minutes)}`;
+    const span = timeSpan(item);
     const spent = duration(item.minutes);
     const meta = fitBoth(textWidth(span) + 1 + textWidth(spent) <= labelWidth ? span : "", spent, labelWidth);
     text(x + 1, y + h - 1, meta, { fg: fg && bg ? mix(fg, bg, 0.75) : COLOR.dim, bg, block: true });
@@ -2283,7 +2311,7 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
   out.push(...renderCells(layout.rows, tty));
 
   const listed = (item: Entry & { booked?: boolean }) =>
-    `  ${paint(`${weekday(item.date)} ${item.date.slice(5)} ${clock(item.start)}–${clock(item.start + item.minutes)}`, COLOR.dim)} ` +
+    `  ${paint(`${weekday(item.date)} ${item.date.slice(5)} ${timeSpan(item)}`, COLOR.dim)} ` +
     `${paint(duration(item.minutes).padStart(5), undefined, { bold: true })}  ${paint(item.issue, kindColor(item), { bold: true, link: item.issue === "?" ? undefined : url(item.issue) })}  ${fit(item.description, Math.max(20, width - 40))}`;
   if (layout.hidden.length) {
     out.push("", paint("Not in the grid (outside the hours or too many overlaps):", COLOR.dim));
@@ -2542,7 +2570,7 @@ export function parseLines(text: string, now: Date, problems: string[]): DraftLi
       !time && `${start} is not a time`,
       spent === 0 && "the duration is 0",
       time && hours * 60 + minutes + spent > 24 * 60 && `${start} plus ${length} runs past midnight`,
-      time && date === today && hours * 60 + minutes + spent > now.getHours() * 60 + now.getMinutes() && `${start} plus ${length} ends after now (${clock(now.getHours() * 60 + now.getMinutes())})`,
+      time && date === today && hours * 60 + minutes + spent > minuteOf(now) && `${start} plus ${length} ends after now (${clock(minuteOf(now))})`,
       !VALID_KEY.test(issue) && (issue === "?" ? "? is not an issue yet; replace it with an issue key" : `"${issue}" is not an issue key such as SHOP-123`),
     ].filter((error) => typeof error === "string");
     for (const error of errors) problems.push(`${at}: ${error}.`);
@@ -2552,7 +2580,7 @@ export function parseLines(text: string, now: Date, problems: string[]): DraftLi
 }
 
 function span(entry: Entry): string {
-  return `${clock(entry.start)}–${clock(entry.start + entry.minutes)} ${entry.issue}`;
+  return `${timeSpan(entry)} ${entry.issue}`;
 }
 
 /**
@@ -2611,10 +2639,10 @@ export function classify(entries: DraftLine[], idOf: (key: string) => number, ex
 }
 
 /** The required minutes per date; without them only the headers lose their hours, booking does not depend on them. */
-async function requiredMinutes(dates: string[]): Promise<Map<string, number>> {
+async function requiredByDate(dates: string[]): Promise<Map<string, number>> {
   const required = new Map<string, number>();
   try {
-    for (const day of await schedule(dates[0], dates[dates.length - 1])) required.set(day.date, Math.round(day.requiredSeconds / 60));
+    for (const day of await schedule(dates[0], dates[dates.length - 1])) required.set(day.date, requiredOf(day));
   } catch {
     // The headers show the booked hours alone.
   }
@@ -2662,12 +2690,12 @@ async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> 
   };
 
   const dates = [...new Set(planned.map((entry) => entry.date))].sort();
-  const required = await requiredMinutes(dates);
+  const required = await requiredByDate(dates);
   const range = dates.length > 1 ? `${dates[0]}..${dates[dates.length - 1]}` : dates[0];
   const widths = lineWidths(planned);
   const statusWidth = dryRun ? "would book".length : "booked 00000000".length;
   // check found every key in Jira.
-  const url = issueUrl(site, new Set(planned.map((entry) => entry.issue.slice(0, entry.issue.lastIndexOf("-")))));
+  const url = issueUrl(site, new Set(planned.map((entry) => projectOf(entry.issue))));
 
   const line = (entry: Planned, status: string, statusColor: Rgb, note = "") => {
     const muted = statusColor === COLOR.dim;
