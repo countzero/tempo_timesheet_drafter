@@ -134,6 +134,8 @@ const RANGE_HINT = 'Run "node . draft --help" for all range forms.';
 const DRAFT_VARIABLES = ["TEMPO_API_TOKEN", "ATLASSIAN_SITE", "ATLASSIAN_EMAIL", "ATLASSIAN_API_TOKEN", "GITHUB_TOKEN", "GITHUB_OWNERS"];
 const BOOK_VARIABLES = DRAFT_VARIABLES.slice(0, 4);
 
+// --- config ---------------------------------------------------------------
+
 /** A mistake in the command line: printed with the relevant usage line, exit code 2. */
 export class UsageError extends Error {
   usage: string;
@@ -208,6 +210,11 @@ function dayDiff(from: string, to: string): number {
 
 function daysInMonth(year: number, month: number): number {
   return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+export function isDate(date: string): boolean {
+  const value = new Date(`${date}T12:00:00Z`);
+  return !Number.isNaN(value.getTime()) && value.toISOString().slice(0, 10) === date;
 }
 
 function weekday(date: string): string {
@@ -1101,10 +1108,6 @@ async function calendar(from: string, to: string, warnings: string[]): Promise<C
 
 // --- planning -------------------------------------------------------------
 
-function shorten(text: string, length: number): string {
-  return text.length > length ? `${text.slice(0, length - 1)}…` : text;
-}
-
 // A change to many issues at once is one action: it counts once, for their common parent, else for the batch issue
 // viewed first around it (Tempo names one too), else for the one changed first.
 export function collapseBatches(activities: Activity[], views: View[] = []): Activity[] {
@@ -1326,22 +1329,7 @@ export function planDay(
   return { entries: entries.sort((a, b) => a.start - b.start), notes };
 }
 
-
-const NOTE_ORDER = ["?", "!", "·"];
-
-/** Questions, then missing hours, then where the lines come from; each names its line by time or key. */
-export function dayNotes(entries: Entry[], notes: string[]): string[] {
-  const result = entries.filter((entry) => entry.question).map((entry) => `? ${clock(entry.start)} ${entry.issue === "?" ? entry.description : entry.issue}: ${entry.question}`);
-  result.push(...notes);
-  const meetings = entries.filter((entry) => entry.meeting).map((entry) => `${clock(entry.start)} ${entry.issue}`);
-  if (meetings.length) result.push(`· calendar: ${meetings.join(", ")}`);
-  const evidence = new Map<string, string>();
-  for (const entry of entries) if (entry.evidence && !evidence.has(entry.issue)) evidence.set(entry.issue, entry.evidence);
-  for (const [issue, text] of evidence) result.push(`· ${issue}: ${text}`);
-  return result.sort((a, b) => NOTE_ORDER.indexOf(a[0]) - NOTE_ORDER.indexOf(b[0]));
-}
-
-// --- commands -------------------------------------------------------------
+// --- draft ----------------------------------------------------------------
 
 async function draft(input: string, view?: "grid" | "list"): Promise<void> {
   const today = localDate(new Date());
@@ -1414,16 +1402,116 @@ async function draft(input: string, view?: "grid" | "list"): Promise<void> {
   );
 }
 
-// --- output ---------------------------------------------------------------
+// --- text -----------------------------------------------------------------
 
-interface DayPlan {
-  date: string;
-  required: number;
-  holiday?: string;
-  booked: Entry[];
-  entries: Entry[];
-  notes: string[];
+const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const WIDE = /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]|\p{Extended_Pictographic}/u;
+
+function graphemes(text: string): string[] {
+  return Array.from(SEGMENTER.segment(text), (part) => part.segment);
 }
+
+function cellWidth(grapheme: string): number {
+  return WIDE.test(grapheme) ? 2 : 1;
+}
+
+function textWidth(text: string): number {
+  return graphemes(text).reduce((sum, grapheme) => sum + cellWidth(grapheme), 0);
+}
+
+function shorten(text: string, length: number): string {
+  return text.length > length ? `${text.slice(0, length - 1)}…` : text;
+}
+
+export function fit(text: string, width: number): string {
+  if (width <= 0) return "";
+  if (textWidth(text) <= width) return text;
+  let result = "";
+  let used = 0;
+  for (const grapheme of graphemes(text)) {
+    if (used + cellWidth(grapheme) > width - 1) break;
+    result += grapheme;
+    used += cellWidth(grapheme);
+  }
+  return `${result.trimEnd()}…`;
+}
+
+/** `left` and `right` in exactly `width` cells; `left` gets cut first. */
+export function fitBoth(left: string, right: string, width: number): string {
+  const rightWidth = textWidth(right);
+  if (!right || rightWidth + 2 > width) return fit(left || right, width);
+  const head = fit(left, width - rightWidth - 1);
+  return head + " ".repeat(width - textWidth(head) - rightWidth) + right;
+}
+
+/** Word wrap into at most `lines` lines; a word too long for a line is cut, overflow ends the last line with "…". */
+export function wrapFit(text: string, width: number, lines: number): string[] {
+  if (width <= 0 || lines <= 0) return [];
+  const all: string[] = [];
+  let line = "";
+  for (const word of text.split(/\s+/).filter(Boolean).map((each) => fit(each, width))) {
+    if (!line) line = word;
+    else if (textWidth(line) + 1 + textWidth(word) <= width) line += ` ${word}`;
+    else {
+      all.push(line);
+      line = word;
+    }
+  }
+  if (line) all.push(line);
+  if (all.length <= lines) return all;
+  const kept = all.slice(0, lines);
+  kept[lines - 1] = fit(all.slice(lines - 1).join(" "), width);
+  return kept;
+}
+
+/** Word wrap by display width; a word longer than a line is split between graphemes. Nothing is cut. */
+export function wrapWords(text: string, width: number): string[] {
+  if (!Number.isFinite(width)) return [text];
+  const lines: string[] = [];
+  let line = "";
+  for (const word of text.split(" ")) {
+    let rest = graphemes(word);
+    while (textWidth(rest.join("")) > width) {
+      if (line) lines.push(line);
+      line = "";
+      let used = 0;
+      let count = 0;
+      while (count < rest.length && used + cellWidth(rest[count]) <= width) used += cellWidth(rest[count++]);
+      lines.push(rest.slice(0, Math.max(1, count)).join(""));
+      rest = rest.slice(Math.max(1, count));
+    }
+    const piece = rest.join("");
+    if (!line) line = piece;
+    else if (textWidth(line) + 1 + textWidth(piece) <= width) line += ` ${piece}`;
+    else {
+      lines.push(line);
+      line = piece;
+    }
+  }
+  lines.push(line);
+  return lines;
+}
+
+/** Colored pieces flowed onto lines of at most `width` cells; continuation lines start with `indent`. */
+function flow(pieces: { text: string; painted: string }[], width: number, first: string, indent: string): string[] {
+  const lines: string[] = [];
+  let line = first;
+  let used = textWidth(stripVTControlCharacters(first));
+  for (const piece of pieces) {
+    const size = textWidth(piece.text);
+    if (used + size > width && used > textWidth(stripVTControlCharacters(indent))) {
+      lines.push(line.trimEnd());
+      line = indent;
+      used = textWidth(stripVTControlCharacters(indent));
+    }
+    line += piece.painted;
+    used += size;
+  }
+  lines.push(line.trimEnd());
+  return lines;
+}
+
+// --- terminal -------------------------------------------------------------
 
 type Rgb = [number, number, number];
 
@@ -1453,33 +1541,6 @@ let linksAllowed = true;
 /** Issue keys link to Jira wherever colors are shown; no terminal list, since Windows Terminal often sets no WT_SESSION. */
 export function hyperlinks(env: NodeJS.ProcessEnv): boolean {
   return Boolean(env.ATLASSIAN_SITE) && env.FORCE_HYPERLINK !== "0" && env.TERM_PROGRAM !== "Apple_Terminal";
-}
-
-/** The Jira address of a key whose project is in `projects`, for linking keys in free text. */
-export function issueUrl(site: string | undefined, projects: Set<string>): (key: string) => string | undefined {
-  const base = site?.replace(/\/$/, "");
-  return (key) => (base && projects.has(key.slice(0, key.lastIndexOf("-"))) ? `${base}/browse/${key}` : undefined);
-}
-
-/** `text` cut into plain pieces and the issue keys `url` knows, each with its address. */
-export function keyPieces(text: string, url: (key: string) => string | undefined): { text: string; link?: string }[] {
-  const pieces: { text: string; link?: string }[] = [];
-  let last = 0;
-  for (const match of text.matchAll(ISSUE_KEY)) {
-    const link = url(match[0]);
-    if (!link) continue;
-    if (match.index > last) pieces.push({ text: text.slice(last, match.index) });
-    pieces.push({ text: match[0], link });
-    last = match.index + match[0].length;
-  }
-  if (last < text.length || !pieces.length) pieces.push({ text: text.slice(last) });
-  return pieces;
-}
-
-/** Keys of the Jira projects and of every line shown link; "?" and made-up words such as UTF-8 do not. */
-function dayLinks(days: DayPlan[], projects: Set<string>): (key: string) => string | undefined {
-  const issues = days.flatMap((day) => [...day.booked, ...day.entries]).filter((entry) => entry.issue !== "?");
-  return issueUrl(process.env.ATLASSIAN_SITE, new Set([...projects, ...issues.map((entry) => entry.issue.slice(0, entry.issue.lastIndexOf("-")))]));
 }
 
 function terminal(): { depth: number; width: number; links: boolean } | undefined {
@@ -1532,51 +1593,56 @@ function painter(tty: { depth: number; links: boolean } | undefined) {
   };
 }
 
-/** Word wrap by display width; a word longer than a line is split between graphemes. Nothing is cut. */
-export function wrapWords(text: string, width: number): string[] {
-  if (!Number.isFinite(width)) return [text];
-  const lines: string[] = [];
-  let line = "";
-  for (const word of text.split(" ")) {
-    let rest = graphemes(word);
-    while (textWidth(rest.join("")) > width) {
-      if (line) lines.push(line);
-      line = "";
-      let used = 0;
-      let count = 0;
-      while (count < rest.length && used + cellWidth(rest[count]) <= width) used += cellWidth(rest[count++]);
-      lines.push(rest.slice(0, Math.max(1, count)).join(""));
-      rest = rest.slice(Math.max(1, count));
-    }
-    const piece = rest.join("");
-    if (!line) line = piece;
-    else if (textWidth(line) + 1 + textWidth(piece) <= width) line += ` ${piece}`;
-    else {
-      lines.push(line);
-      line = piece;
-    }
-  }
-  lines.push(line);
-  return lines;
+// --- output ---------------------------------------------------------------
+
+interface DayPlan {
+  date: string;
+  required: number;
+  holiday?: string;
+  booked: Entry[];
+  entries: Entry[];
+  notes: string[];
 }
 
-/** Colored pieces flowed onto lines of at most `width` cells; continuation lines start with `indent`. */
-function flow(pieces: { text: string; painted: string }[], width: number, first: string, indent: string): string[] {
-  const lines: string[] = [];
-  let line = first;
-  let used = textWidth(stripVTControlCharacters(first));
-  for (const piece of pieces) {
-    const size = textWidth(piece.text);
-    if (used + size > width && used > textWidth(stripVTControlCharacters(indent))) {
-      lines.push(line.trimEnd());
-      line = indent;
-      used = textWidth(stripVTControlCharacters(indent));
-    }
-    line += piece.painted;
-    used += size;
+/** The Jira address of a key whose project is in `projects`, for linking keys in free text. */
+export function issueUrl(site: string | undefined, projects: Set<string>): (key: string) => string | undefined {
+  const base = site?.replace(/\/$/, "");
+  return (key) => (base && projects.has(key.slice(0, key.lastIndexOf("-"))) ? `${base}/browse/${key}` : undefined);
+}
+
+/** `text` cut into plain pieces and the issue keys `url` knows, each with its address. */
+export function keyPieces(text: string, url: (key: string) => string | undefined): { text: string; link?: string }[] {
+  const pieces: { text: string; link?: string }[] = [];
+  let last = 0;
+  for (const match of text.matchAll(ISSUE_KEY)) {
+    const link = url(match[0]);
+    if (!link) continue;
+    if (match.index > last) pieces.push({ text: text.slice(last, match.index) });
+    pieces.push({ text: match[0], link });
+    last = match.index + match[0].length;
   }
-  lines.push(line.trimEnd());
-  return lines;
+  if (last < text.length || !pieces.length) pieces.push({ text: text.slice(last) });
+  return pieces;
+}
+
+/** Keys of the Jira projects and of every line shown link; "?" and made-up words such as UTF-8 do not. */
+function dayLinks(days: DayPlan[], projects: Set<string>): (key: string) => string | undefined {
+  const issues = days.flatMap((day) => [...day.booked, ...day.entries]).filter((entry) => entry.issue !== "?");
+  return issueUrl(process.env.ATLASSIAN_SITE, new Set([...projects, ...issues.map((entry) => entry.issue.slice(0, entry.issue.lastIndexOf("-")))]));
+}
+
+const NOTE_ORDER = ["?", "!", "·"];
+
+/** Questions, then missing hours, then where the lines come from; each names its line by time or key. */
+export function dayNotes(entries: Entry[], notes: string[]): string[] {
+  const result = entries.filter((entry) => entry.question).map((entry) => `? ${clock(entry.start)} ${entry.issue === "?" ? entry.description : entry.issue}: ${entry.question}`);
+  result.push(...notes);
+  const meetings = entries.filter((entry) => entry.meeting).map((entry) => `${clock(entry.start)} ${entry.issue}`);
+  if (meetings.length) result.push(`· calendar: ${meetings.join(", ")}`);
+  const evidence = new Map<string, string>();
+  for (const entry of entries) if (entry.evidence && !evidence.has(entry.issue)) evidence.set(entry.issue, entry.evidence);
+  for (const [issue, text] of evidence) result.push(`· ${issue}: ${text}`);
+  return result.sort((a, b) => NOTE_ORDER.indexOf(a[0]) - NOTE_ORDER.indexOf(b[0]));
 }
 
 function kindColor(entry: Entry): Rgb {
@@ -1585,18 +1651,13 @@ function kindColor(entry: Entry): Rgb {
   return entry.evidence ? COLOR.code : COLOR.jira;
 }
 
-const HEADER_LEAD = "# ── ";
-
 /** Cells of a `cells` long rule filled for `done` of `required` minutes; full from the required hours on. */
 export function filledCells(done: number, required: number, cells: number): number {
   return required > 0 ? Math.min(cells, Math.round((done / required) * cells)) : 0;
 }
 
-/**
- * Plain, every line is a draft line or a comment, so book reads the output as is. At a terminal the same lines get
- * color, and long ones wrap: a work line continues indented without "#", so a copied continuation fails loudly in
- * book instead of booking a shortened description; a "#" line continues as a comment.
- */
+const HEADER_LEAD = "# ── ";
+
 /** `# ── Mon 2026-11-02 ━━━━━━──── 4h15m / 7h ──`, shared by the list and book's report. */
 function dayHeader(date: string, done: number, required: number, holiday: string | undefined, width: number, tty: ReturnType<typeof terminal>): string {
   const paint = painter(tty);
@@ -1614,6 +1675,22 @@ function dayHeader(date: string, done: number, required: number, holiday: string
   );
 }
 
+/**
+ * The grid for a person at a terminal, the list (the draft lines book reads) otherwise or on request. A redirect gets
+ * the list even with FORCE_COLOR or --grid, so "draft > draft.txt" always gives a file book can read.
+ */
+function show(range: string, days: DayPlan[], warnings: string[], view: "grid" | "list" | undefined, subtitle = "", projects = new Set<string>()): void {
+  if (view !== "list" && process.stdout.isTTY && terminal()) printGrid(range, days, warnings, subtitle, projects);
+  else printDraft(range, days, warnings, subtitle, projects);
+}
+
+// --- list -----------------------------------------------------------------
+
+/**
+ * Plain, every line is a draft line or a comment, so book reads the output as is. At a terminal the same lines get
+ * color, and long ones wrap: a work line continues indented without "#", so a copied continuation fails loudly in
+ * book instead of booking a shortened description; a "#" line continues as a comment.
+ */
 function printDraft(range: string, days: DayPlan[], warnings: string[], subtitle = "", projects = new Set<string>()): void {
   const tty = terminal();
   const paint = painter(tty);
@@ -1737,62 +1814,7 @@ interface Item extends Entry {
   span: number;
 }
 
-const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-const WIDE = /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]|\p{Extended_Pictographic}/u;
 const ROWS_PER_HOUR = 4;
-
-function graphemes(text: string): string[] {
-  return Array.from(SEGMENTER.segment(text), (part) => part.segment);
-}
-
-function cellWidth(grapheme: string): number {
-  return WIDE.test(grapheme) ? 2 : 1;
-}
-
-function textWidth(text: string): number {
-  return graphemes(text).reduce((sum, grapheme) => sum + cellWidth(grapheme), 0);
-}
-
-export function fit(text: string, width: number): string {
-  if (width <= 0) return "";
-  if (textWidth(text) <= width) return text;
-  let result = "";
-  let used = 0;
-  for (const grapheme of graphemes(text)) {
-    if (used + cellWidth(grapheme) > width - 1) break;
-    result += grapheme;
-    used += cellWidth(grapheme);
-  }
-  return `${result.trimEnd()}…`;
-}
-
-/** `left` and `right` in exactly `width` cells; `left` gets cut first. */
-export function fitBoth(left: string, right: string, width: number): string {
-  const rightWidth = textWidth(right);
-  if (!right || rightWidth + 2 > width) return fit(left || right, width);
-  const head = fit(left, width - rightWidth - 1);
-  return head + " ".repeat(width - textWidth(head) - rightWidth) + right;
-}
-
-/** Word wrap into at most `lines` lines; a word too long for a line is cut, overflow ends the last line with "…". */
-export function wrapFit(text: string, width: number, lines: number): string[] {
-  if (width <= 0 || lines <= 0) return [];
-  const all: string[] = [];
-  let line = "";
-  for (const word of text.split(/\s+/).filter(Boolean).map((each) => fit(each, width))) {
-    if (!line) line = word;
-    else if (textWidth(line) + 1 + textWidth(word) <= width) line += ` ${word}`;
-    else {
-      all.push(line);
-      line = word;
-    }
-  }
-  if (line) all.push(line);
-  if (all.length <= lines) return all;
-  const kept = all.slice(0, lines);
-  kept[lines - 1] = fit(all.slice(lines - 1).join(" "), width);
-  return kept;
-}
 
 function sgr(cell: Cell, depth: number): string {
   const codes = [cell.bold && "1"];
@@ -2044,15 +2066,6 @@ function printGrid(range: string, days: DayPlan[], warnings: string[], subtitle:
   console.log(out.join("\n"));
 }
 
-/**
- * The grid for a person at a terminal, the list (the draft lines book reads) otherwise or on request. A redirect gets
- * the list even with FORCE_COLOR or --grid, so "draft > draft.txt" always gives a file book can read.
- */
-function show(range: string, days: DayPlan[], warnings: string[], view: "grid" | "list" | undefined, subtitle = "", projects = new Set<string>()): void {
-  if (view !== "list" && process.stdout.isTTY && terminal()) printGrid(range, days, warnings, subtitle, projects);
-  else printDraft(range, days, warnings, subtitle, projects);
-}
-
 // --- progress -------------------------------------------------------------
 
 /** A source being fetched: finished after `steps` requests, `details` filled by them for the summary. */
@@ -2168,6 +2181,8 @@ function progress(steps: Record<string, number>) {
   };
 }
 
+// --- demo -----------------------------------------------------------------
+
 /** A made-up week through the same output, without any API call: shows every kind of line. */
 function demo(view?: "grid" | "list"): void {
   // Made-up keys must not link into the real Jira site.
@@ -2245,6 +2260,8 @@ function demo(view?: "grid" | "list"): void {
   );
 }
 
+// --- book -----------------------------------------------------------------
+
 interface DraftLine extends Entry {
   line: number;
 }
@@ -2253,11 +2270,6 @@ interface Planned extends DraftLine {
   issueId: number;
   duplicate: boolean;
   repeats?: number;
-}
-
-export function isDate(date: string): boolean {
-  const value = new Date(`${date}T12:00:00Z`);
-  return !Number.isNaN(value.getTime()) && value.toISOString().slice(0, 10) === date;
 }
 
 export function parseLines(text: string, now: Date, problems: string[]): DraftLine[] {
@@ -2461,27 +2473,6 @@ async function book(text: string, dryRun: boolean): Promise<boolean> {
 
 // --- help -----------------------------------------------------------------
 
-const COMMANDS = ["draft", "book", "demo", "help"];
-const FLAGS: Record<string, string[]> = { draft: ["--grid", "--list"], demo: ["--grid", "--list"], book: ["--dry-run"] };
-
-/** The closest option within an edit distance of 2 (or by prefix), for "did you mean"; never run, only suggested. */
-export function closest(word: string, options: string[]): string | undefined {
-  const distance = (a: string, b: string) => {
-    const d = Array.from({ length: a.length + 1 }, (_, i) => Array.from({ length: b.length + 1 }, (_, j) => (i ? (j ? 0 : i) : j)));
-    for (let i = 1; i <= a.length; i++) {
-      for (let j = 1; j <= b.length; j++) {
-        d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-        if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
-      }
-    }
-    return d[a.length][b.length];
-  };
-  const text = word.toLowerCase();
-  const scored = options.map((option) => ({ option, score: text.length > 1 && option.startsWith(text) ? 0 : distance(text, option) }));
-  const best = scored.sort((a, b) => a.score - b.score)[0];
-  return best && best.score <= 2 ? best.option : undefined;
-}
-
 function helpText(command?: string): string {
   const tty = terminal();
   const paint = painter(tty);
@@ -2623,7 +2614,28 @@ function helpText(command?: string): string {
   ].join("\n");
 }
 
-// --- main -----------------------------------------------------------------
+// --- command line ---------------------------------------------------------
+
+const COMMANDS = ["draft", "book", "demo", "help"];
+const FLAGS: Record<string, string[]> = { draft: ["--grid", "--list"], demo: ["--grid", "--list"], book: ["--dry-run"] };
+
+/** The closest option within an edit distance of 2 (or by prefix), for "did you mean"; never run, only suggested. */
+export function closest(word: string, options: string[]): string | undefined {
+  const distance = (a: string, b: string) => {
+    const d = Array.from({ length: a.length + 1 }, (_, i) => Array.from({ length: b.length + 1 }, (_, j) => (i ? (j ? 0 : i) : j)));
+    for (let i = 1; i <= a.length; i++) {
+      for (let j = 1; j <= b.length; j++) {
+        d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+        if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+      }
+    }
+    return d[a.length][b.length];
+  };
+  const text = word.toLowerCase();
+  const scored = options.map((option) => ({ option, score: text.length > 1 && option.startsWith(text) ? 0 : distance(text, option) }));
+  const best = scored.sort((a, b) => a.score - b.score)[0];
+  return best && best.score <= 2 ? best.option : undefined;
+}
 
 function parseCommand(command: string, args: string[]): { positionals: string[]; flags: Set<string>; usage: string } {
   const usage = { draft: USAGE_DRAFT, book: USAGE_BOOK, demo: USAGE_DEMO }[command] ?? "";
