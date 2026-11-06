@@ -334,6 +334,115 @@ export function withoutKey(text: string, key: string): string {
   return text.replace(key, "").replace(/^[\s:–|[\]()-]+|[\s:–|[\]()-]+$/g, "").replace(/\s{2,}/g, " ") || text;
 }
 
+// --- text -----------------------------------------------------------------
+
+const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const WIDE = /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]|\p{Extended_Pictographic}/u;
+
+function graphemes(text: string): string[] {
+  return Array.from(SEGMENTER.segment(text), (part) => part.segment);
+}
+
+function cellWidth(grapheme: string): number {
+  return WIDE.test(grapheme) ? 2 : 1;
+}
+
+function textWidth(text: string): number {
+  return graphemes(text).reduce((sum, grapheme) => sum + cellWidth(grapheme), 0);
+}
+
+function shorten(text: string, length: number): string {
+  return text.length > length ? `${text.slice(0, length - 1)}…` : text;
+}
+
+export function fit(text: string, width: number): string {
+  if (width <= 0) return "";
+  if (textWidth(text) <= width) return text;
+  let result = "";
+  let used = 0;
+  for (const grapheme of graphemes(text)) {
+    if (used + cellWidth(grapheme) > width - 1) break;
+    result += grapheme;
+    used += cellWidth(grapheme);
+  }
+  return `${result.trimEnd()}…`;
+}
+
+/** `left` and `right` in exactly `width` cells; `left` gets cut first. */
+export function fitBoth(left: string, right: string, width: number): string {
+  const rightWidth = textWidth(right);
+  if (!right || rightWidth + 2 > width) return fit(left || right, width);
+  const head = fit(left, width - rightWidth - 1);
+  return head + " ".repeat(width - textWidth(head) - rightWidth) + right;
+}
+
+/** Word wrap into at most `lines` lines; a word too long for a line is cut, overflow ends the last line with "…". */
+export function wrapFit(text: string, width: number, lines: number): string[] {
+  if (width <= 0 || lines <= 0) return [];
+  const all: string[] = [];
+  let line = "";
+  for (const word of text.split(/\s+/).filter(Boolean).map((each) => fit(each, width))) {
+    if (!line) line = word;
+    else if (textWidth(line) + 1 + textWidth(word) <= width) line += ` ${word}`;
+    else {
+      all.push(line);
+      line = word;
+    }
+  }
+  if (line) all.push(line);
+  if (all.length <= lines) return all;
+  const kept = all.slice(0, lines);
+  kept[lines - 1] = fit(all.slice(lines - 1).join(" "), width);
+  return kept;
+}
+
+/** Word wrap by display width; a word longer than a line is split between graphemes. Nothing is cut. */
+export function wrapWords(text: string, width: number): string[] {
+  if (!Number.isFinite(width)) return [text];
+  const lines: string[] = [];
+  let line = "";
+  for (const word of text.split(" ")) {
+    let rest = graphemes(word);
+    while (textWidth(rest.join("")) > width) {
+      if (line) lines.push(line);
+      line = "";
+      let used = 0;
+      let count = 0;
+      while (count < rest.length && used + cellWidth(rest[count]) <= width) used += cellWidth(rest[count++]);
+      lines.push(rest.slice(0, Math.max(1, count)).join(""));
+      rest = rest.slice(Math.max(1, count));
+    }
+    const piece = rest.join("");
+    if (!line) line = piece;
+    else if (textWidth(line) + 1 + textWidth(piece) <= width) line += ` ${piece}`;
+    else {
+      lines.push(line);
+      line = piece;
+    }
+  }
+  lines.push(line);
+  return lines;
+}
+
+/** Colored pieces flowed onto lines of at most `width` cells; continuation lines start with `indent`. */
+function flow(pieces: { text: string; painted: string }[], width: number, first: string, indent: string): string[] {
+  const lines: string[] = [];
+  let line = first;
+  let used = textWidth(stripVTControlCharacters(first));
+  for (const piece of pieces) {
+    const size = textWidth(piece.text);
+    if (used + size > width && used > textWidth(stripVTControlCharacters(indent))) {
+      lines.push(line.trimEnd());
+      line = indent;
+      used = textWidth(stripVTControlCharacters(indent));
+    }
+    line += piece.painted;
+    used += size;
+  }
+  lines.push(line.trimEnd());
+  return lines;
+}
+
 // --- APIs -----------------------------------------------------------------
 
 /** fetch, retried up to three times after 429 and, for GET only, after a 5xx: a repeated POST could book twice. */
@@ -1474,168 +1583,6 @@ export function planDays(days: Day[], existing: Booked[], activities: Activity[]
   });
 }
 
-// --- draft ----------------------------------------------------------------
-
-async function draft(input: string, view: ViewName | undefined, now: Date): Promise<void> {
-  const today = localDate(now);
-  const [from, requestedTo] = parseRange(input, today);
-  const to = requestedTo > today ? today : requestedTo;
-  if (from > to) throw new UsageError(`${from} is in the future (today is ${weekday(today)} ${today})`, COMMANDS.draft.usage, RANGE_HINT);
-
-  // One list per source, joined in a fixed order: the sources run in parallel and would mix their warnings.
-  const sourceWarnings = { commits: [] as string[], pullRequests: [] as string[], calendar: [] as string[] };
-  // Steps are the requests until a source is finished; GitHub counts its repositories separately.
-  const bar = progress({ Tempo: 2, Jira: 4, Calendar: 1, GitHub: 2 });
-  let fetched: [Day[], Booked[], Commit[], PullRequestEvent[], CalendarEvent[], Activity[], Set<string>, View[]];
-  try {
-    // GitHub and the calendar need nothing from Jira, so they start with the first requests.
-    const user = viewer();
-    const counted = (total: number, skipped: number) => bar.count("GitHub", total, "repos", skipped);
-    const history = bar.track("GitHub", commits(from, to, user, sourceWarnings.commits, counted), (found) => `${found.length} commits`);
-    const pulls = bar.track("GitHub", pullRequests(from, to, user, sourceWarnings.pullRequests), (found) => {
-      const reviews = found.filter((event) => event.kind === "pr-review").length;
-      return `${reviews} reviews, ${found.length - reviews} comments`;
-    });
-    const events = bar.track("Calendar", calendar(from, to, sourceWarnings.calendar), (found) => `${found.length} meetings`);
-    // Awaited later; without a handler, a failure during the first requests would make them unhandled rejections.
-    for (const early of [user, history, pulls, events]) early.catch(() => {});
-    const [account, projects, days] = await Promise.all([bar.track("Jira", accountId()), bar.track("Jira", projectKeys()), bar.track("Tempo", schedule(from, to))]);
-    const [existing, code, reviews, meetings, tickets, views] = await Promise.all([
-      bar.track("Tempo", booked(account, from, to), (found) => `${found.length} worklogs`),
-      history,
-      pulls,
-      events,
-      bar.track("Jira", jiraActivity(account, from, to), (found) => `${found.length} changes`),
-      bar.track("Jira", lastViews(from, to), (found) => `${found.length} views`),
-    ]);
-    fetched = [days, existing, code, reviews, meetings, tickets, projects, views];
-  } catch (error) {
-    bar.failed();
-    throw error;
-  }
-  bar.done();
-  const [days, existing, code, reviews, meetings, tickets, projects, views] = fetched;
-  const activities = [...commitActivities(code, projects), ...pullRequestActivities(reviews, projects), ...tickets];
-  show(
-    screen(now),
-    `${from}..${to}`,
-    planDays(days, existing, activities, meetings, views, projects, now),
-    [...sourceWarnings.commits, ...sourceWarnings.pullRequests, ...sourceWarnings.calendar],
-    view,
-    "",
-    projects,
-  );
-}
-
-// --- text -----------------------------------------------------------------
-
-const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-const WIDE = /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]|\p{Extended_Pictographic}/u;
-
-function graphemes(text: string): string[] {
-  return Array.from(SEGMENTER.segment(text), (part) => part.segment);
-}
-
-function cellWidth(grapheme: string): number {
-  return WIDE.test(grapheme) ? 2 : 1;
-}
-
-function textWidth(text: string): number {
-  return graphemes(text).reduce((sum, grapheme) => sum + cellWidth(grapheme), 0);
-}
-
-function shorten(text: string, length: number): string {
-  return text.length > length ? `${text.slice(0, length - 1)}…` : text;
-}
-
-export function fit(text: string, width: number): string {
-  if (width <= 0) return "";
-  if (textWidth(text) <= width) return text;
-  let result = "";
-  let used = 0;
-  for (const grapheme of graphemes(text)) {
-    if (used + cellWidth(grapheme) > width - 1) break;
-    result += grapheme;
-    used += cellWidth(grapheme);
-  }
-  return `${result.trimEnd()}…`;
-}
-
-/** `left` and `right` in exactly `width` cells; `left` gets cut first. */
-export function fitBoth(left: string, right: string, width: number): string {
-  const rightWidth = textWidth(right);
-  if (!right || rightWidth + 2 > width) return fit(left || right, width);
-  const head = fit(left, width - rightWidth - 1);
-  return head + " ".repeat(width - textWidth(head) - rightWidth) + right;
-}
-
-/** Word wrap into at most `lines` lines; a word too long for a line is cut, overflow ends the last line with "…". */
-export function wrapFit(text: string, width: number, lines: number): string[] {
-  if (width <= 0 || lines <= 0) return [];
-  const all: string[] = [];
-  let line = "";
-  for (const word of text.split(/\s+/).filter(Boolean).map((each) => fit(each, width))) {
-    if (!line) line = word;
-    else if (textWidth(line) + 1 + textWidth(word) <= width) line += ` ${word}`;
-    else {
-      all.push(line);
-      line = word;
-    }
-  }
-  if (line) all.push(line);
-  if (all.length <= lines) return all;
-  const kept = all.slice(0, lines);
-  kept[lines - 1] = fit(all.slice(lines - 1).join(" "), width);
-  return kept;
-}
-
-/** Word wrap by display width; a word longer than a line is split between graphemes. Nothing is cut. */
-export function wrapWords(text: string, width: number): string[] {
-  if (!Number.isFinite(width)) return [text];
-  const lines: string[] = [];
-  let line = "";
-  for (const word of text.split(" ")) {
-    let rest = graphemes(word);
-    while (textWidth(rest.join("")) > width) {
-      if (line) lines.push(line);
-      line = "";
-      let used = 0;
-      let count = 0;
-      while (count < rest.length && used + cellWidth(rest[count]) <= width) used += cellWidth(rest[count++]);
-      lines.push(rest.slice(0, Math.max(1, count)).join(""));
-      rest = rest.slice(Math.max(1, count));
-    }
-    const piece = rest.join("");
-    if (!line) line = piece;
-    else if (textWidth(line) + 1 + textWidth(piece) <= width) line += ` ${piece}`;
-    else {
-      lines.push(line);
-      line = piece;
-    }
-  }
-  lines.push(line);
-  return lines;
-}
-
-/** Colored pieces flowed onto lines of at most `width` cells; continuation lines start with `indent`. */
-function flow(pieces: { text: string; painted: string }[], width: number, first: string, indent: string): string[] {
-  const lines: string[] = [];
-  let line = first;
-  let used = textWidth(stripVTControlCharacters(first));
-  for (const piece of pieces) {
-    const size = textWidth(piece.text);
-    if (used + size > width && used > textWidth(stripVTControlCharacters(indent))) {
-      lines.push(line.trimEnd());
-      line = indent;
-      used = textWidth(stripVTControlCharacters(indent));
-    }
-    line += piece.painted;
-    used += size;
-  }
-  lines.push(line.trimEnd());
-  return lines;
-}
-
 // --- terminal -------------------------------------------------------------
 
 type Rgb = [number, number, number];
@@ -1905,15 +1852,6 @@ function dayHeader(date: string, done: number, required: number, holiday: string
     `${paint("━".repeat(filled), done >= required ? COLOR.done : COLOR.dim)}${paint("─".repeat(rule - filled), COLOR.faint)} ` +
     `${paint(amount, holiday ? COLOR.dim : done >= required ? COLOR.done : undefined, { bold: true })}${paint(" ──", COLOR.faint)}`
   );
-}
-
-/**
- * The grid for a person at a terminal, the list (the draft lines book reads) otherwise or on request. A redirect gets
- * the list even with FORCE_COLOR or --grid, so "draft > draft.txt" always gives a file book can read.
- */
-function show(screen: Screen, range: string, days: DayPlan[], warnings: string[], view: ViewName | undefined, subtitle = "", projects = new Set<string>()): void {
-  if (view !== "list" && screen.tty?.wraps) printGrid(screen, range, days, warnings, subtitle, projects);
-  else printDraft(screen, range, days, warnings, subtitle, projects);
 }
 
 // --- list -----------------------------------------------------------------
@@ -2338,6 +2276,15 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
   console.log(out.join("\n"));
 }
 
+/**
+ * The grid for a person at a terminal, the list (the draft lines book reads) otherwise or on request. A redirect gets
+ * the list even with FORCE_COLOR or --grid, so "draft > draft.txt" always gives a file book can read.
+ */
+function show(screen: Screen, range: string, days: DayPlan[], warnings: string[], view: ViewName | undefined, subtitle = "", projects = new Set<string>()): void {
+  if (view !== "list" && screen.tty?.wraps) printGrid(screen, range, days, warnings, subtitle, projects);
+  else printDraft(screen, range, days, warnings, subtitle, projects);
+}
+
 // --- progress -------------------------------------------------------------
 
 /** A source being fetched: finished after `steps` requests, `details` filled by them for the summary. */
@@ -2451,6 +2398,59 @@ function progress(steps: Record<string, number>) {
     done: () => finish("\n"),
     failed: () => finish(""),
   };
+}
+
+// --- draft ----------------------------------------------------------------
+
+async function draft(input: string, view: ViewName | undefined, now: Date): Promise<void> {
+  const today = localDate(now);
+  const [from, requestedTo] = parseRange(input, today);
+  const to = requestedTo > today ? today : requestedTo;
+  if (from > to) throw new UsageError(`${from} is in the future (today is ${weekday(today)} ${today})`, COMMANDS.draft.usage, RANGE_HINT);
+
+  // One list per source, joined in a fixed order: the sources run in parallel and would mix their warnings.
+  const sourceWarnings = { commits: [] as string[], pullRequests: [] as string[], calendar: [] as string[] };
+  // Steps are the requests until a source is finished; GitHub counts its repositories separately.
+  const bar = progress({ Tempo: 2, Jira: 4, Calendar: 1, GitHub: 2 });
+  let fetched: [Day[], Booked[], Commit[], PullRequestEvent[], CalendarEvent[], Activity[], Set<string>, View[]];
+  try {
+    // GitHub and the calendar need nothing from Jira, so they start with the first requests.
+    const user = viewer();
+    const counted = (total: number, skipped: number) => bar.count("GitHub", total, "repos", skipped);
+    const history = bar.track("GitHub", commits(from, to, user, sourceWarnings.commits, counted), (found) => `${found.length} commits`);
+    const pulls = bar.track("GitHub", pullRequests(from, to, user, sourceWarnings.pullRequests), (found) => {
+      const reviews = found.filter((event) => event.kind === "pr-review").length;
+      return `${reviews} reviews, ${found.length - reviews} comments`;
+    });
+    const events = bar.track("Calendar", calendar(from, to, sourceWarnings.calendar), (found) => `${found.length} meetings`);
+    // Awaited later; without a handler, a failure during the first requests would make them unhandled rejections.
+    for (const early of [user, history, pulls, events]) early.catch(() => {});
+    const [account, projects, days] = await Promise.all([bar.track("Jira", accountId()), bar.track("Jira", projectKeys()), bar.track("Tempo", schedule(from, to))]);
+    const [existing, code, reviews, meetings, tickets, views] = await Promise.all([
+      bar.track("Tempo", booked(account, from, to), (found) => `${found.length} worklogs`),
+      history,
+      pulls,
+      events,
+      bar.track("Jira", jiraActivity(account, from, to), (found) => `${found.length} changes`),
+      bar.track("Jira", lastViews(from, to), (found) => `${found.length} views`),
+    ]);
+    fetched = [days, existing, code, reviews, meetings, tickets, projects, views];
+  } catch (error) {
+    bar.failed();
+    throw error;
+  }
+  bar.done();
+  const [days, existing, code, reviews, meetings, tickets, projects, views] = fetched;
+  const activities = [...commitActivities(code, projects), ...pullRequestActivities(reviews, projects), ...tickets];
+  show(
+    screen(now),
+    `${from}..${to}`,
+    planDays(days, existing, activities, meetings, views, projects, now),
+    [...sourceWarnings.commits, ...sourceWarnings.pullRequests, ...sourceWarnings.calendar],
+    view,
+    "",
+    projects,
+  );
 }
 
 // --- demo -----------------------------------------------------------------
@@ -2583,7 +2583,7 @@ export function parseLines(text: string, now: Date, problems: string[]): DraftLi
   return entries;
 }
 
-function span(entry: Entry): string {
+function spanOf(entry: Entry): string {
   return `${timeSpan(entry)} ${entry.issue}`;
 }
 
@@ -2634,8 +2634,8 @@ export function classify(entries: DraftLine[], idOf: (key: string) => number, ex
     const repeats = existing.some(same) ? undefined : planned.find((other) => !other.duplicate && same(other))?.line;
     const duplicate = repeats !== undefined || existing.some(same);
     if (!duplicate) {
-      for (const other of existing.filter(overlaps)) warnings.push(`line ${entry.line} overlaps booked ${span(other)}.`);
-      for (const other of planned.filter((other) => !other.duplicate && overlaps(other))) warnings.push(`line ${entry.line} overlaps line ${other.line} (${span(other)}).`);
+      for (const other of existing.filter(overlaps)) warnings.push(`line ${entry.line} overlaps booked ${spanOf(other)}.`);
+      for (const other of planned.filter((other) => !other.duplicate && overlaps(other))) warnings.push(`line ${entry.line} overlaps line ${other.line} (${spanOf(other)}).`);
     }
     planned.push({ ...entry, issueId: id, duplicate, repeats });
   }
