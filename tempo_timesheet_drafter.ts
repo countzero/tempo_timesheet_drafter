@@ -198,6 +198,10 @@ export function duration(minutes: number): string {
   return `${hours ? `${hours}h` : ""}${rest || !hours ? `${rest}m` : ""}`;
 }
 
+function totalMinutes(entries: { minutes: number }[]): number {
+  return entries.reduce((sum, entry) => sum + entry.minutes, 0);
+}
+
 function localDate(value: Date): string {
   return value.toLocaleDateString("sv-SE");
 }
@@ -1181,7 +1185,7 @@ export function planDay(
   const occupied: [number, number][] = existing.map((entry) => [entry.start, entry.start + entry.minutes]);
   const overlaps = (start: number, end: number) => occupied.some(([from, to]) => from < end && start < to);
   const required = Math.round(day.requiredSeconds / 60);
-  const bookedMinutes = existing.reduce((sum, entry) => sum + entry.minutes, 0);
+  const bookedMinutes = totalMinutes(existing);
 
   for (const meeting of meetings) {
     const issue = issueKey(meeting.title, projects);
@@ -1326,7 +1330,7 @@ export function planDay(
     notes.push({ mark: "·", text: `viewed: ${text.join(", ")}` });
   }
 
-  const drafted = entries.reduce((sum, entry) => sum + entry.minutes, 0);
+  const drafted = totalMinutes(entries);
   const open = required - bookedMinutes - drafted;
   const spans = [...existing, ...entries].map((entry) => [entry.start, entry.start + entry.minutes]).sort(([a], [b]) => a - b);
   const gaps: string[] = [];
@@ -1698,9 +1702,81 @@ function kindColor(entry: Entry): Rgb {
   return entry.evidence ? COLOR.github : COLOR.jira;
 }
 
+/** Booked entries first, then the drafted ones, each marked. */
+function dayItems(day: DayPlan): { entry: Entry; booked: boolean }[] {
+  return [...day.booked.map((entry) => ({ entry, booked: true })), ...day.entries.map((entry) => ({ entry, booked: false }))];
+}
+
+const SOURCES: [string, Rgb][] = [["Jira", COLOR.jira], ["meeting", COLOR.meeting], ["GitHub", COLOR.github], ["? no issue", COLOR.unknown]];
+
+function markColor(mark: Mark): Rgb {
+  return mark === "?" ? COLOR.attention : mark === "!" ? COLOR.warning : COLOR.dim;
+}
+
+/** "Mon" for a date. */
+function weekdayName(date: string): string {
+  const name = weekday(date);
+  return `${name[0].toUpperCase()}${name.slice(1)}`;
+}
+
+/** "4h15m / 7h ✓" with the holiday in front; `check` adds the ✓ once the required hours are reached. */
+function dayAmount(done: number, required: number, holiday: string | undefined, between: string, check: boolean): string {
+  const hours = required ? `${duration(done)}${between}${duration(required)}${check && done >= required ? " ✓" : ""}` : done ? duration(done) : "";
+  return holiday ? [holiday, hours].filter(Boolean).join(" · ") : hours;
+}
+
 /** Cells of a `cells` long rule filled for `done` of `required` minutes; full from the required hours on. */
 export function filledCells(done: number, required: number, cells: number): number {
   return required > 0 ? Math.min(cells, Math.round((done / required) * cells)) : 0;
+}
+
+type Paint = ReturnType<typeof painter>;
+
+/** Issue keys in a text linked to Jira; the rest painted as given. */
+function keyLinker(paint: Paint, url: (key: string) => string | undefined): (text: string, color?: Rgb) => string {
+  return (text, color) => keyPieces(text, url).map((each) => paint(each.text, color, { link: each.link })).join("");
+}
+
+/** Text for `flow`: `text` gives the width, `painted` what is shown, dim unless given. */
+function textPiece(paint: Paint, text: string, painted = paint(text, COLOR.dim)): { text: string; painted: string } {
+  return { text, painted };
+}
+
+/** Widths of the duration and key columns, so times, keys and descriptions line up. */
+function lineWidths(entries: Entry[]): { duration: number; issue: number } {
+  return {
+    duration: Math.max(3, ...entries.map((entry) => duration(entry.minutes).length)),
+    issue: Math.max(3, ...entries.map((entry) => entry.issue.length)),
+  };
+}
+
+/**
+ * A worklog as the list and book print it: `lead`, date, time, duration, key, description. Long descriptions wrap
+ * under the description's column, without "#", so a copied continuation fails in book.
+ */
+function worklogLines(
+  paint: Paint,
+  lead: { text: string; painted: string },
+  entry: Entry,
+  description: string,
+  widths: { duration: number; issue: number },
+  width: number,
+  look: { text?: Rgb; issue?: Rgb; link?: string },
+): string[] {
+  const spent = duration(entry.minutes).padStart(widths.duration);
+  const column = lead.text.length + `${entry.date} ${clock(entry.start)} ${spent}  `.length + widths.issue + 2;
+  const parts = wrapWords(description, Math.max(8, width - column));
+  return [
+    lead.painted +
+      paint(entry.date, COLOR.faint) +
+      ` ${paint(clock(entry.start), look.text)} ` +
+      paint(spent, look.text, { bold: true }) +
+      "  " +
+      paint(entry.issue, look.issue, { bold: true, link: look.link }) +
+      " ".repeat(widths.issue - entry.issue.length + 2) +
+      paint(parts[0], look.text),
+    ...parts.slice(1).map((part) => " ".repeat(column) + paint(part, look.text)),
+  ];
 }
 
 const HEADER_LEAD = "# ── ";
@@ -1708,9 +1784,8 @@ const HEADER_LEAD = "# ── ";
 /** `# ── Mon 2026-11-02 ━━━━━━──── 4h15m / 7h ──`, shared by the list and book's report. */
 function dayHeader(date: string, done: number, required: number, holiday: string | undefined, width: number, tty: Tty | undefined, today: string): string {
   const paint = painter(tty);
-  const name = `${weekday(date)[0].toUpperCase()}${weekday(date).slice(1)} ${date}`;
-  const hours = required ? `${duration(done)} / ${duration(required)}${tty && done >= required ? " ✓" : ""}` : done ? duration(done) : "";
-  const amount = holiday ? [holiday, hours].filter(Boolean).join(" · ") : hours;
+  const name = `${weekdayName(date)} ${date}`;
+  const amount = dayAmount(done, required, holiday, " / ", Boolean(tty));
   const rule = Math.max(2, (Number.isFinite(width) ? width : 72) - 10 - name.length - textWidth(amount));
   // The rule itself shows how much of the day is drafted or booked: a separate bar made the header noisy.
   // Plain output keeps a plain rule, so a file for book stays as it was.
@@ -1741,45 +1816,30 @@ function show(screen: Screen, range: string, days: DayPlan[], warnings: string[]
 function printDraft({ tty, now, site }: Screen, range: string, days: DayPlan[], warnings: string[], subtitle: string, projects: Set<string>): void {
   const paint = painter(tty);
   const url = dayLinks(days, projects, site);
-  const withKeys = (text: string, color?: Rgb) => keyPieces(text, url).map((piece) => paint(piece.text, color, { link: piece.link })).join("");
+  const withKeys = keyLinker(paint, url);
   const width = listWidth(tty);
   const today = localDate(now);
-  const all = days.flatMap((day) => [...day.booked, ...day.entries]);
-  const issueWidth = Math.max(3, ...all.map((entry) => entry.issue.length));
-  const durationWidth = Math.max(3, ...all.map((entry) => duration(entry.minutes).length));
+  const widths = lineWidths(days.flatMap((day) => [...day.booked, ...day.entries]));
   // Every date lines up with the weekday in the day header; book ignores the indent.
   const indent = " ".repeat(HEADER_LEAD.length);
   const bookedPrefix = "#  ✓ ";
   const out: string[] = [];
 
-  const comment = (text: string, mark = "", markColor?: Rgb) => {
+  const comment = (text: string, mark = "", color?: Rgb) => {
     // A mark stands under the ✓ of booked lines.
     const lead = mark ? bookedPrefix.slice(0, bookedPrefix.indexOf("✓")) : "# ";
     const indentWidth = lead.length + (mark ? mark.length + 1 : 0);
     wrapWords(text, Math.max(8, width - indentWidth)).forEach((part, index) => {
-      const head = index === 0 ? paint(lead, COLOR.faint) + (mark ? `${paint(mark, markColor, { bold: true })} ` : "") : paint("#".padEnd(indentWidth), COLOR.faint);
+      const head = index === 0 ? paint(lead, COLOR.faint) + (mark ? `${paint(mark, color, { bold: true })} ` : "") : paint("#".padEnd(indentWidth), COLOR.faint);
       out.push(head + withKeys(part, COLOR.dim));
     });
   };
   const header = (date: string, done: number, required: number, holiday?: string) => out.push(dayHeader(date, done, required, holiday, width, tty, today));
   const entryLine = (entry: Entry, booked: boolean) => {
-    const prefix = booked ? bookedPrefix : indent;
-    const head = `${entry.date} ${clock(entry.start)} ${duration(entry.minutes).padStart(durationWidth)}  `;
-    const column = prefix.length + head.length + issueWidth + 2;
-    const text = booked ? COLOR.dim : undefined;
+    const lead = booked ? { text: bookedPrefix, painted: `${paint("#", COLOR.faint)}  ${paint("✓", COLOR.dim, { bold: true })} ` } : { text: indent, painted: indent };
     const link = entry.issue === "?" ? undefined : url(entry.issue);
-    const parts = wrapWords(entry.description, Math.max(8, width - column));
-    out.push(
-      (booked ? `${paint("#", COLOR.faint)}  ${paint("✓", COLOR.dim, { bold: true })} ` : indent) +
-        paint(entry.date, COLOR.faint) +
-        ` ${paint(clock(entry.start), text)} ` +
-        paint(duration(entry.minutes).padStart(durationWidth), text, { bold: true }) +
-        "  " +
-        paint(entry.issue, booked ? COLOR.dim : kindColor(entry), { bold: true, link }) +
-        " ".repeat(issueWidth - entry.issue.length + 2) +
-        paint(parts[0], text),
-    );
-    for (const part of parts.slice(1)) out.push(" ".repeat(column) + paint(part, text));
+    const look = booked ? { text: COLOR.dim, issue: COLOR.dim, link } : { issue: kindColor(entry), link };
+    out.push(...worklogLines(paint, lead, entry, entry.description, widths, width, look));
   };
 
   const gap = () => out.push(paint("#", COLOR.faint));
@@ -1787,17 +1847,16 @@ function printDraft({ tty, now, site }: Screen, range: string, days: DayPlan[], 
   gap();
   out.push(`${paint("# ", COLOR.faint)}${paint("Note:", COLOR.dim, { bold: true })} ${paint('Lines without "#" will be booked!', COLOR.dim)}`);
   gap();
-  const piece = (text: string, painted = paint(text, COLOR.dim)) => ({ text, painted });
   const legendIndent = paint("#         ", COLOR.faint);
   const marks: [string, Rgb, string][] = [
-    ["?", COLOR.attention, "needs an answer, "],
-    ["!", COLOR.warning, "hours short, "],
+    ["?", markColor("?"), "needs an answer, "],
+    ["!", markColor("!"), "hours short, "],
     ["✓", COLOR.dim, "booked, "],
-    ["·", COLOR.dim, "where lines come from"],
+    ["·", markColor("·"), "where lines come from"],
   ];
   out.push(
     ...flow(
-      marks.map(([mark, color, meaning]) => piece(`${mark} ${meaning}`, `${paint(mark, color, { bold: true })} ${paint(meaning, COLOR.dim)}`)),
+      marks.map(([mark, color, meaning]) => textPiece(paint, `${mark} ${meaning}`, `${paint(mark, color, { bold: true })} ${paint(meaning, COLOR.dim)}`)),
       width,
       `${paint("# ", COLOR.faint)}${paint("Legend:", COLOR.dim, { bold: true })} `,
       legendIndent,
@@ -1805,9 +1864,16 @@ function printDraft({ tty, now, site }: Screen, range: string, days: DayPlan[], 
   );
   // The key colors only exist with colors; without them that line would explain nothing.
   if (tty && tty.depth > 1) {
-    const keys: [string, Rgb][] = [["Jira", COLOR.jira], ["meeting", COLOR.meeting], ["GitHub", COLOR.github], ["? no issue", COLOR.unknown]];
+    const more = (index: number) => index < SOURCES.length - 1;
     out[out.length - 1] += paint(",", COLOR.dim);
-    out.push(...flow(keys.map(([name, color], index) => piece(`${name}${index < keys.length - 1 ? ", " : ""}`, `${paint(name, color, { bold: true })}${index < keys.length - 1 ? paint(", ", COLOR.dim) : ""}`)), width, legendIndent, legendIndent));
+    out.push(
+      ...flow(
+        SOURCES.map(([name, color], index) => textPiece(paint, `${name}${more(index) ? ", " : ""}`, `${paint(name, color, { bold: true })}${more(index) ? paint(", ", COLOR.dim) : ""}`)),
+        width,
+        legendIndent,
+        legendIndent,
+      ),
+    );
   }
   for (const day of days) {
     if (day.required <= 0 && !day.booked.length && !day.entries.length) {
@@ -1817,15 +1883,13 @@ function printDraft({ tty, now, site }: Screen, range: string, days: DayPlan[], 
       }
       continue;
     }
-    const done = [...day.booked, ...day.entries].reduce((sum, entry) => sum + entry.minutes, 0);
     gap();
-    header(day.date, done, day.required, day.holiday);
+    header(day.date, totalMinutes([...day.booked, ...day.entries]), day.required, day.holiday);
     gap();
-    const lines = [...day.booked.map((entry) => ({ entry, booked: true })), ...day.entries.map((entry) => ({ entry, booked: false }))];
-    for (const { entry, booked } of lines.sort((a, b) => a.entry.start - b.entry.start)) entryLine(entry, booked);
+    for (const { entry, booked } of dayItems(day).sort((a, b) => a.entry.start - b.entry.start)) entryLine(entry, booked);
     const notes = dayNotes(day.entries, day.notes);
     if (notes.length) gap();
-    for (const { mark, text } of notes) comment(text, mark, mark === "?" ? COLOR.attention : mark === "!" ? COLOR.warning : COLOR.dim);
+    for (const { mark, text } of notes) comment(text, mark, markColor(mark));
   }
   if (warnings.length) out.push(paint("#", COLOR.faint));
   for (const warning of warnings) comment(`warning: ${warning}`);
@@ -1942,7 +2006,7 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
   const color = depth > 1;
   const paint = painter(tty);
   const url = dayLinks(days, projects, site);
-  const withKeys = (text: string, color?: Rgb) => keyPieces(text, url).map((piece) => paint(piece.text, color, { link: piece.link })).join("");
+  const withKeys = keyLinker(paint, url);
   const shown = days.filter((day) => day.required > 0 || day.holiday || day.booked.length || day.entries.length);
   const all = shown.flatMap((day) => [...day.booked, ...day.entries]);
   const first = Math.min(8 * 60, ...all.map((entry) => entry.start));
@@ -1978,11 +2042,10 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
   const xs = shown.map((_, index) => gutter + index * (columnWidth + 1) + 1);
   const rowCount = (hours[1] - hours[0]) * ROWS_PER_HOUR;
   shown.forEach((day, index) => {
-    const done = [...day.booked, ...day.entries].reduce((sum, entry) => sum + entry.minutes, 0);
+    const done = totalMinutes([...day.booked, ...day.entries]);
     const full = done >= day.required;
-    const name = `${weekday(day.date)[0].toUpperCase()}${weekday(day.date).slice(1)} ${day.date.slice(8)}`;
-    const hours = day.required ? `${duration(done)}/${duration(day.required)}${full ? " ✓" : ""}` : done ? duration(done) : "";
-    const amount = day.holiday ? [day.holiday, hours].filter(Boolean).join(" · ") : hours;
+    const name = `${weekdayName(day.date)} ${day.date.slice(8)}`;
+    const amount = dayAmount(done, day.required, day.holiday, "/", true);
     const label = fitBoth(name, amount, columnWidth);
     put(xs[index] - 1, 0, "│", { fg: COLOR.faint });
     text(xs[index], 0, label, { bold: true, fg: day.date === today ? COLOR.attention : day.holiday ? COLOR.dim : undefined });
@@ -2005,8 +2068,7 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
   const hiddenItems: Item[] = [];
   const blocks: { x: number; y: number; w: number }[] = [];
   shown.forEach((day, index) => {
-    const entries = [...day.booked.map((entry) => ({ entry, booked: true })), ...day.entries.map((entry) => ({ entry, booked: false }))];
-    const { placed, hidden } = lanes(entries, Math.max(1, Math.floor((columnWidth + 1) / 7)));
+    const { placed, hidden } = lanes(dayItems(day), Math.max(1, Math.floor((columnWidth + 1) / 7)));
     hiddenItems.push(...hidden);
     for (const item of placed) {
       const from = Math.max(item.start, hours[0] * 60);
@@ -2067,15 +2129,14 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
   }
 
   const out: string[] = [];
-  const piece = (text: string, painted = paint(text, COLOR.dim)) => ({ text, painted });
-  out.push("", ...flow([piece(`Draft ${range}`, paint(`Draft ${range}`, undefined, { bold: true })), ...subtitle.split(/(?<= )/).map((word) => piece(word))], width, "", "  "), "");
-  const legend: [string, Rgb][] = [["Jira", COLOR.jira], ["meeting", COLOR.meeting], ["GitHub", COLOR.github], ["? no issue", COLOR.unknown]];
+  const heading = `Draft ${range}`;
+  out.push("", ...flow([textPiece(paint, heading, paint(heading, undefined, { bold: true })), ...subtitle.split(/(?<= )/).map((word) => textPiece(paint, word))], width, "", "  "), "");
   out.push(
     ...flow(
       [
-        ...legend.map(([name, rgb]) => piece(`▌ ${name}   `, `${paint("▌", rgb)} ${paint(name, COLOR.dim)}   `)),
-        piece("✓ booked   "),
-        piece("─ now", `${paint("─", COLOR.attention)} ${paint("now", COLOR.dim)}`),
+        ...SOURCES.map(([name, rgb]) => textPiece(paint, `▌ ${name}   `, `${paint("▌", rgb)} ${paint(name, COLOR.dim)}   `)),
+        textPiece(paint, "✓ booked   "),
+        textPiece(paint, "─ now", `${paint("─", COLOR.attention)} ${paint("now", COLOR.dim)}`),
       ],
       width,
       "",
@@ -2094,11 +2155,11 @@ function printGrid(screen: Screen, range: string, days: DayPlan[], warnings: str
   }
   const open = shown.map((day) => ({ day, notes: dayNotes(day.entries, day.notes).filter((note) => note.mark !== "·") })).filter(({ notes }) => notes.length);
   for (const { day, notes } of open) {
-    out.push("", paint(`${weekday(day.date)[0].toUpperCase()}${weekday(day.date).slice(1)} ${day.date}`, day.date === today ? COLOR.attention : undefined, { bold: true }));
+    out.push("", paint(`${weekdayName(day.date)} ${day.date}`, day.date === today ? COLOR.attention : undefined, { bold: true }));
     for (const note of notes) {
       wrapWords(note.text, Math.max(20, Math.min(width, 120) - 4)).forEach((part, index) => {
         const mark = index ? " " : note.mark;
-        out.push(`  ${paint(mark, note.mark === "?" ? COLOR.attention : COLOR.warning, { bold: true })} ${withKeys(part, COLOR.dim)}`);
+        out.push(`  ${paint(mark, markColor(note.mark), { bold: true })} ${withKeys(part, COLOR.dim)}`);
       });
     }
   }
@@ -2418,10 +2479,10 @@ async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> 
   const width = listWidth(tty);
   const say = (line = "") => console.log(line);
   const gap = () => say(paint("#", COLOR.faint));
-  const comment = (text: string, mark = "", markColor?: Rgb) => {
+  const comment = (text: string, mark = "", color?: Rgb) => {
     const lead = mark ? `#   ${mark} ` : "# ";
     wrapWords(text, Math.max(8, width - lead.length)).forEach((part, index) => {
-      const head = index ? paint("#".padEnd(lead.length), COLOR.faint) : `${paint(mark ? "#   " : "# ", COLOR.faint)}${mark ? `${paint(mark, markColor, { bold: true })} ` : ""}`;
+      const head = index ? paint("#".padEnd(lead.length), COLOR.faint) : `${paint(mark ? "#   " : "# ", COLOR.faint)}${mark ? `${paint(mark, color, { bold: true })} ` : ""}`;
       say(head + paint(part, COLOR.dim));
     });
   };
@@ -2434,29 +2495,17 @@ async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> 
     // Only the headers lose their required hours; booking does not depend on them.
   }
   const range = dates.length > 1 ? `${dates[0]}..${dates[dates.length - 1]}` : dates[0];
-  const issueWidth = Math.max(3, ...planned.map((entry) => entry.issue.length));
-  const durationWidth = Math.max(3, ...planned.map((entry) => duration(entry.minutes).length));
+  const widths = lineWidths(planned);
   const statusWidth = dryRun ? "would book".length : "booked 00000000".length;
-  const sum = (entries: Entry[]) => entries.reduce((total, entry) => total + entry.minutes, 0);
   // check found every key in Jira.
   const url = issueUrl(site, new Set(planned.map((entry) => entry.issue.slice(0, entry.issue.lastIndexOf("-")))));
 
   const line = (entry: Planned, status: string, statusColor: Rgb, note = "") => {
     const muted = statusColor === COLOR.dim;
     const text = muted ? COLOR.dim : undefined;
-    const head = `${status.padEnd(statusWidth)}  ${entry.date} ${clock(entry.start)} ${duration(entry.minutes).padStart(durationWidth)}  `;
-    const column = head.length + issueWidth + 2;
-    const parts = wrapWords(entry.description + (note ? ` (${note})` : ""), Math.max(8, width - column));
-    say(
-      paint(status.padEnd(statusWidth), statusColor, { bold: !muted }) +
-        `  ${paint(entry.date, COLOR.faint)} ${paint(clock(entry.start), text)} ` +
-        paint(duration(entry.minutes).padStart(durationWidth), text, { bold: true }) +
-        "  " +
-        paint(entry.issue, text, { bold: true, link: url(entry.issue) }) +
-        " ".repeat(issueWidth - entry.issue.length + 2) +
-        paint(parts[0], text),
-    );
-    for (const part of parts.slice(1)) say(" ".repeat(column) + paint(part, text));
+    const lead = { text: `${status.padEnd(statusWidth)}  `, painted: `${paint(status.padEnd(statusWidth), statusColor, { bold: !muted })}  ` };
+    const description = entry.description + (note ? ` (${note})` : "");
+    for (const each of worklogLines(paint, lead, entry, description, widths, width, { text, issue: text, link: url(entry.issue) })) say(each);
   };
 
   if (Number.isFinite(width)) say();
@@ -2469,7 +2518,7 @@ async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> 
   for (const date of dates) {
     const lines = planned.filter((entry) => entry.date === date).sort((a, b) => a.start - b.start || a.line - b.line);
     gap();
-    say(dayHeader(date, sum(existing.filter((entry) => entry.date === date)) + sum(lines.filter((entry) => !entry.duplicate)), required.get(date) ?? 0, undefined, width, tty, localDate(now)));
+    say(dayHeader(date, totalMinutes(existing.filter((entry) => entry.date === date)) + totalMinutes(lines.filter((entry) => !entry.duplicate)), required.get(date) ?? 0, undefined, width, tty, localDate(now)));
     gap();
     const failures: string[] = [];
     for (const entry of lines) {
@@ -2522,7 +2571,7 @@ function helpText(command: string | undefined, tty: Tty | undefined, now: Date, 
   const dim = (text: string) => paint(text, COLOR.dim);
   const today = localDate(now);
   const [monday, sunday] = parseRange("week", today);
-  const day = `${weekday(today)[0].toUpperCase()}${weekday(today).slice(1)}`;
+  const day = weekdayName(today);
   const todayLine = `Today is ${paint(`${day} ${today}`, COLOR.attention, { bold: true })}: week = kw${isoWeek(today)} = ${monday}..${sunday}.`;
   const ranges = [
     "today (or day), yesterday, week, last-week, kw45, 2026-11-03,",
