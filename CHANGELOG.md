@@ -3,6 +3,11 @@
 This changelog follows [Common Changelog](https://common-changelog.org) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-10
+
+### Changed
+- Book lines in the future, as Tempo allows, instead of rejecting a later date or a line that ends after now.
+
 ## [1.1.1] - 2026-11-06
 
 ### Changed
@@ -46,6 +51,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Add the agent skill `SKILL.md`, which drafts, describes the work, asks about open points and books only after your approval.
 - Add a `node:test` suite that scores the planning against real booked days.
 - Add the README, `AGENTS.md` and the MIT license.
+
+[1.2.0]: https://github.com/countzero/tempo_timesheet_drafter/releases/tag/v1.2.0
 
 [1.1.1]: https://github.com/countzero/tempo_timesheet_drafter/releases/tag/v1.1.1
 
