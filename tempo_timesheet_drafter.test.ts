@@ -188,7 +188,7 @@ test('parseLines reads a line and keeps a # in the description', () => {
     const problems: Array<string> = [];
 
     // Act
-    const lines = parseLines('2026-11-03 10:00 15m TEAM-1 Fix #12 in the parser', NOW, problems);
+    const lines = parseLines('2026-11-03 10:00 15m TEAM-1 Fix #12 in the parser', problems);
 
     // Assert
     assert.deepEqual(problems, []);
@@ -205,20 +205,34 @@ test('parseLines names each stopped line with its number', () => {
         '# ── Tue 2026-11-03 ──',
         '2026-11-03 14:00 1h ? Kundentermin',
         '',
-        '2026-11-06 09:00 1h TEAM-1 Daily',
-        '2026-11-05 11:45 30m TEAM-1 Daily',
+        '2026-11-03 25:00 1h TEAM-1 Daily',
+        '2026-11-03 23:45 30m TEAM-1 Daily',
     ].join('\n');
 
     // Act
-    const lines = parseLines(text, NOW, problems);
+    const lines = parseLines(text, problems);
 
     // Assert
     assert.deepEqual(lines, []);
     assert.deepEqual(problems, [
         'line 2: ? is not an issue yet; replace it with an issue key.',
-        'line 4: 2026-11-06 is in the future.',
-        'line 5: 11:45 plus 30m ends after now (12:00).',
+        'line 4: 25:00 is not a time.',
+        'line 5: 23:45 plus 30m runs past midnight.',
     ]);
+});
+
+test('parseLines accepts lines in the future', () => {
+
+    // Arrange
+    const problems: Array<string> = [];
+    const text = ['2026-11-06 09:00 1h TEAM-1 Daily', '2026-11-05 11:45 30m TEAM-1 Daily'].join('\n');
+
+    // Act
+    const lines = parseLines(text, problems);
+
+    // Assert
+    assert.deepEqual(problems, []);
+    assert.deepEqual(lines.map((line) => line.date), ['2026-11-06', '2026-11-05']);
 });
 
 test('classify skips a line booked already or repeated and warns about overlaps', () => {

@@ -23,7 +23,7 @@ The program lies in this skill's base directory. Run it with Node.js 24.2 or new
    from (`· calendar:` lists the meetings, which stay at their time; `· viewed:` the quarter-hours
    filled because the user last opened the issue then).
 3. **Check** the lines without `?` with `book --dry-run` (same stdin as in step 6). It books nothing,
-   lists every problem with its line number (unknown issue, impossible date or time, future date),
+   lists every problem with its line number (unknown issue, impossible date or time),
    warns about overlaps and prints each day's total against the required hours. Fix what you can
    from the message; ask the user about the rest.
 4. **Show** the complete list in a code block. Ask every question that a `?` line or the dry run

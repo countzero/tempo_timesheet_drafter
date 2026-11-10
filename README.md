@@ -279,9 +279,8 @@ Without a file, `book` reads the lines from stdin. It checks all lines first and
 - has `?` instead of an issue key
 - names an issue that does not exist
 - has an impossible date, time or duration
-- lies in the future
 
-It then lists the problems with their line numbers. A line identical to an existing worklog (issue, date, start, duration) or to an earlier line is skipped, so running `book` twice is safe; a line whose start or duration you changed counts as new. Overlaps are reported before booking and booked anyway. Finally, `book` prints the Tempo worklog id of each line and each day's total against the required hours.
+It then lists the problems with their line numbers. Lines in the future are booked like any other, as in Tempo. A line identical to an existing worklog (issue, date, start, duration) or to an earlier line is skipped, so running `book` twice is safe; a line whose start or duration you changed counts as new. Overlaps are reported before booking and booked anyway. Finally, `book` prints the Tempo worklog id of each line and each day's total against the required hours.
 
 ### Draft and book in one go
 

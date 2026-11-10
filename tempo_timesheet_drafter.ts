@@ -2544,8 +2544,7 @@ export interface Planned extends DraftLine {
   repeats?: number;
 }
 
-export function parseLines(text: string, now: Date, problems: string[]): DraftLine[] {
-  const today = localDate(now);
+export function parseLines(text: string, problems: string[]): DraftLine[] {
   const entries: DraftLine[] = [];
   text.split(/\r?\n/).forEach((raw, index) => {
     // Colors survive a copy from the terminal or FORCE_COLOR in a redirect; they are not part of the line.
@@ -2570,11 +2569,9 @@ export function parseLines(text: string, now: Date, problems: string[]): DraftLi
     const time = hours <= 23 && minutes <= 59;
     const errors = [
       !isDate(date) && `${date} is not a date`,
-      isDate(date) && date > today && `${date} is in the future`,
       !time && `${start} is not a time`,
       spent === 0 && "the duration is 0",
       time && hours * 60 + minutes + spent > 24 * 60 && `${start} plus ${length} runs past midnight`,
-      time && date === today && hours * 60 + minutes + spent > minuteOf(now) && `${start} plus ${length} ends after now (${clock(minuteOf(now))})`,
       !VALID_KEY.test(issue) && (issue === "?" ? "? is not an issue yet; replace it with an issue key" : `"${issue}" is not an issue key such as SHOP-123`),
     ].filter((error) => typeof error === "string");
     for (const error of errors) problems.push(`${at}: ${error}.`);
@@ -2593,10 +2590,9 @@ function spanOf(entry: Entry): string {
  */
 async function check(
   text: string,
-  now: Date,
 ): Promise<{ account: string; planned: Planned[]; existing: Booked[]; warnings: string[]; remaining: Map<number, number> }> {
   const problems: string[] = [];
-  const entries = parseLines(text, now, problems);
+  const entries = parseLines(text, problems);
   const abort = () => new Error(`${problems.length} problem(s), nothing was booked:\n${problems.join("\n")}\nFix these lines and run book again.`);
   if (problems.length) throw abort();
   if (!entries.length) return { account: "", planned: [], existing: [], warnings: [], remaining: new Map() };
@@ -2675,7 +2671,7 @@ async function postWorklog(entry: Planned, account: string, remaining: Map<numbe
  * required hours, then one line per worklog with its outcome in front. Lines print as they are posted.
  */
 async function book(text: string, dryRun: boolean, now: Date): Promise<boolean> {
-  const { account, planned, existing, warnings, remaining } = await check(text, now);
+  const { account, planned, existing, warnings, remaining } = await check(text);
   if (!planned.length) {
     console.log("Nothing to book.");
     return true;
@@ -2801,11 +2797,11 @@ function helpText(command: string | undefined, tty: Tty | undefined, now: Date, 
       "",
       `  ${name("--dry-run")}   check every line and show what would be booked; books nothing`,
       "",
-      "First every line is checked: format, real date and time, not in the",
-      "future, issue exists in Jira, no ? as issue. If one fails, nothing is",
-      "booked and each problem is listed with its line number. A line identical",
-      "to an existing worklog or an earlier line is skipped, so running book",
-      "twice is safe. Overlaps only warn.",
+      "First every line is checked: format, real date and time, issue exists",
+      "in Jira, no ? as issue. If one fails, nothing is booked and each problem",
+      "is listed with its line number. A line identical to an existing worklog",
+      "or an earlier line is skipped, so running book twice is safe. Lines in",
+      "the future are booked like any other. Overlaps only warn.",
       "",
       `${heading("Line:")}  YYYY-MM-DD HH:MM <duration> <ISSUE-KEY> <description>`,
       "       2026-11-03 09:30 30m TEAM-1 Daily standup",
